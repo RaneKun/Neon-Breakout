@@ -67,7 +67,7 @@ python neon_breakout.py
 - Navigate the main menu
 - Choose **START** to begin from Stage 1
 - Or **CONTINUE** to pick up from your best progress
-- Unlock **STAGE SELECT** by beating all 10 stages!
+- Unlock **STAGE SELECT** and **ENDLESS MODE** by beating all 10 stages!
 
 ---
 
