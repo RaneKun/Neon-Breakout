@@ -13,6 +13,7 @@
 
 ### 🎯 Core Gameplay
 - **10 Hand-Tuned Stages** - Each with 5 unique brick patterns
+- **Endless Mode** - Unlocks after game clear and every stage here is random and never ending!
 - **Escalating Difficulty** - More HP, unbreakable bricks, and faster ball speed as you progress
 - **Time Pressure** - Each stage has a time limit that triggers a **difficulty spike** when it expires!
 - **Persistent Progress** - Your best stage reached and high scores are saved automatically
