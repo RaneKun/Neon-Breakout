@@ -37,6 +37,7 @@ import json
 import math
 import random
 import sys
+import uuid
 
 import numpy as np
 import pygame
@@ -138,7 +139,11 @@ def load_highscores():
         with open(HIGHSCORE_FILE, "r") as f:
             data = json.load(f)
         if isinstance(data, list):
-            cleaned = [e for e in data if isinstance(e, dict) and "score" in e and "stage" in e]
+            cleaned = []
+            for e in data:
+                if isinstance(e, dict) and "score" in e and "stage" in e:
+                    e.setdefault("endless", False)  # older saves predate this field
+                    cleaned.append(e)
             cleaned.sort(key=lambda e: e["score"], reverse=True)
             return cleaned[:MAX_HIGHSCORES]
     except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -146,10 +151,19 @@ def load_highscores():
     return []
 
 
-def save_highscore(score, stage):
-    """Append a new score, keep the top MAX_HIGHSCORES, write to disk. Returns the updated list."""
+def save_highscore(score, stage, endless=False, run_id=None):
+    """Append/update a score, keep the top MAX_HIGHSCORES, write to disk. Returns the
+    updated list. When `run_id` is given, any existing entry for that same run is
+    replaced rather than duplicated - this lets us persist the score continuously
+    while a run is still in progress (see Game._autosave_tick) without spamming the
+    high score list with one entry per autosave tick."""
     scores = load_highscores()
-    scores.append({"score": score, "stage": stage})
+    if run_id is not None:
+        scores = [e for e in scores if e.get("run_id") != run_id]
+    entry = {"score": score, "stage": stage, "endless": endless}
+    if run_id is not None:
+        entry["run_id"] = run_id
+    scores.append(entry)
     scores.sort(key=lambda e: e["score"], reverse=True)
     scores = scores[:MAX_HIGHSCORES]
     try:
@@ -481,6 +495,8 @@ def _build_sounds():
         "laser_charge": _to_sound(_sweep_array(180, 420, 0.5, "sine", 0.22)),
         "laser_fire": _to_sound(_sweep_array(900, 120, 0.22, "saw", 0.4)),
         "laser_hit": _to_sound(_sweep_array(500, 90, 0.4, "saw", 0.42)),
+        "countdown_tick": _to_sound(_tone_array(660, 0.09, "square", 0.28)),
+        "countdown_go": _arpeggio_sound([660, 988], 0.1, "square", 0.32),
     }
 
 
@@ -918,6 +934,24 @@ def draw_text_center(surface, text, font, color, center, glow=None):
     surf = font.render(text, True, color)
     rect = surf.get_rect(center=center)
     surface.blit(surf, rect)
+
+
+def _heartbeat_pulse(t):
+    """0..1 intensity tracing a two-beat 'lub-dub' heartbeat rhythm on a ~1s cycle."""
+    cycle = t % 1.0
+
+    def bump(center, width):
+        d = abs(cycle - center)
+        return max(0.0, 1.0 - d / width)
+
+    return min(1.0, max(bump(0.05, 0.09), bump(0.28, 0.09) * 0.7))
+
+
+def heartbeat_color(t, dim=(90, 20, 25), bright=(255, 90, 100)):
+    """Lerp between a dim and bright red following _heartbeat_pulse - used to make the
+    LIVES label blink like a heartbeat monitor when the player is down to their last chance."""
+    k = _heartbeat_pulse(t)
+    return tuple(int(dim[i] + (bright[i] - dim[i]) * k) for i in range(3))
 
 
 # --------------------------------------------------------------------------
@@ -1417,6 +1451,50 @@ def build_bricks(stage):
 
 
 # --------------------------------------------------------------------------
+# ENDLESS MODE (unlocked after all 10 stages are cleared - see Game.start_endless).
+# Reuses the same difficulty curve as the numbered stages but keeps scaling past
+# Stage 10 forever, and picks a random brick pattern each level instead of the
+# fixed 10-stage cycle - never the same pattern twice in a row.
+# --------------------------------------------------------------------------
+ENDLESS_PATTERNS = ["full", "checker", "pyramid", "diamond", "curtain", "fortress"]
+
+
+def endless_stage_config(stage, last_pattern):
+    """Same tuning curve as stage_config, extended past Stage 10 forever, but with
+    a randomly chosen (never-repeating-consecutively) brick pattern."""
+    choices = [p for p in ENDLESS_PATTERNS if p != last_pattern] or ENDLESS_PATTERNS
+    return {
+        "rows": min(4 + (stage - 1) // 2, 9),
+        "hp_max": min(1 + (stage - 1) // 3, 4),
+        "unbreak_chance": min(0.35, max(0.0, (stage - 3) * 0.025)),
+        "ball_speed": BASE_BALL_SPEED + (stage - 1) * 0.72 * SCALE,
+        "time_limit": 120,
+        "pattern": random.choice(choices),
+    }
+
+
+def build_endless_bricks(stage, last_pattern):
+    cfg = endless_stage_config(stage, last_pattern)
+    rows, cols = cfg["rows"], COLS
+    usable_w = WIDTH - MARGIN_X * 2
+    brick_w = (usable_w - BRICK_GAP * (cols - 1)) / cols
+    bricks = []
+    rng = random.Random()  # true randomness each level (unlike the deterministic per-stage seed)
+
+    for row in range(rows):
+        for col in range(cols):
+            if not pattern_alive(cfg["pattern"], row, col, rows, cols):
+                continue
+            x = MARGIN_X + col * (brick_w + BRICK_GAP)
+            y = BRICK_TOP + row * (BRICK_H + BRICK_GAP)
+            hp = rng.randint(1, cfg["hp_max"])
+            unbreakable = rng.random() < cfg["unbreak_chance"] and row != rows - 1
+            b = Brick(x, y, brick_w, BRICK_H, hp, unbreakable)
+            bricks.append(b)
+    return bricks, cfg
+
+
+# --------------------------------------------------------------------------
 # MAIN GAME
 # --------------------------------------------------------------------------
 STATE_MENU = "menu"
@@ -1464,14 +1542,34 @@ class Game:
         self._geometry_dirty = False
         self._geometry_save_accum = 0.0
         self._score_finalized = False
+        self._run_id = None
+        self._last_autosaved_score = 0
+        self._autosave_accum = 0.0
+        self.endless = False
+        self._last_endless_pattern = None
+        self.resume_cooldown = 0.0
+        self.score = 0
+        self.stage = 1
         log("Game initialized, entering menu state.")
         self.reset_full()
         self.state = STATE_MENU  # start on the menu, not straight into READY
 
+    def _begin_new_run(self):
+        """Closes out whatever run was previously in progress (saving it if it hadn't
+        already been saved via death/victory/quit) and resets autosave tracking for
+        the run about to start."""
+        self.finalize_score()
+        self._score_finalized = False
+        self._run_id = uuid.uuid4().hex
+        self._last_autosaved_score = 0
+        self._autosave_accum = 0.0
+
     def reset_full(self):
+        self._begin_new_run()
         self.stage = 1
+        self.endless = False
         self.score = 0
-        self.lives = 3
+        self.lives = 4  # 3 hearts shown at start (hearts displayed = lives - 1)
         self.paddle = Paddle()
         self.balls = []
         self.bricks = []
@@ -1483,21 +1581,20 @@ class Game:
         self.mouse_control_active = False
         self.is_new_best = False
         self.highscore_rank = None
-        self._score_finalized = False
         log(f"Full reset called. Starting Stage {self.stage}.")
         self.load_stage(self.stage)
 
     def start_at_stage(self, stage):
         """Used by Stage Select / Continue to jump straight into any stage."""
+        self._begin_new_run()
         self.stage = stage
         self.score = 0
-        self.lives = 3
+        self.lives = 4  # 3 hearts shown at start (hearts displayed = lives - 1)
         self.particles = []
         self.powerups = []
         self.lasers = []
         self.is_new_best = False
         self.highscore_rank = None
-        self._score_finalized = False
         self.load_stage(stage)
         log(f"Starting directly at Stage {stage}.")
 
@@ -1508,6 +1605,24 @@ class Game:
         target = CONFIG.get("max_stage_reached", 1)
         self.start_at_stage(target)
         log(f"Continuing from Stage {target} (best progress so far).")
+
+    def start_endless(self):
+        """ENDLESS MODE: unlocked once all 10 stages have been cleared. Keeps scaling
+        difficulty past Stage 10 forever, with a randomly chosen brick pattern each
+        level that never repeats twice in a row (see build_endless_bricks)."""
+        self._begin_new_run()
+        self.endless = True
+        self._last_endless_pattern = None
+        self.stage = TOTAL_STAGES + 1
+        self.score = 0
+        self.lives = 4  # 3 hearts shown at start (hearts displayed = lives - 1)
+        self.particles = []
+        self.powerups = []
+        self.lasers = []
+        self.is_new_best = False
+        self.highscore_rank = None
+        self.load_stage(self.stage)
+        log("Starting Endless Mode.")
 
     def _maybe_apply_pending_resolution(self):
         """Pick up a resolution change queued by a window resize/fullscreen toggle.
@@ -1521,7 +1636,12 @@ class Game:
 
     def load_stage(self, stage):
         self._maybe_apply_pending_resolution()
-        self.bricks, self.cfg = build_bricks(stage)
+        self.resume_cooldown = 0.0
+        if self.endless:
+            self.bricks, self.cfg = build_endless_bricks(stage, self._last_endless_pattern)
+            self._last_endless_pattern = self.cfg["pattern"]
+        else:
+            self.bricks, self.cfg = build_bricks(stage)
         self.paddle = Paddle()
         self.powerups.clear()
         self.particles.clear()
@@ -1705,15 +1825,16 @@ class Game:
         return 1 + (self.stage - 1) * 0.15
 
     def finalize_score(self):
-        """Call once when a run ends (game over, victory, or the player quits/returns to
-        the menu mid-run) to persist the score. Idempotent per run - safe to call more
-        than once (e.g. both on death and on a subsequent quit)."""
+        """Call any time a run ends or is abandoned (game over, victory, quitting,
+        restarting, or returning to the menu mid-run) to persist the score for good.
+        Idempotent per run - safe to call more than once (e.g. both on death and on a
+        subsequent quit)."""
         if self._score_finalized or self.score <= 0:
             return
         self._score_finalized = True
         prior_best = self.highscores[0]["score"] if self.highscores else 0
         self.is_new_best = self.score > prior_best
-        self.highscores = save_highscore(self.score, self.stage)
+        self.highscores = save_highscore(self.score, self.stage, endless=self.endless, run_id=self._run_id)
         self.highscore_rank = next(
             (
                 i
@@ -1723,16 +1844,32 @@ class Game:
             None,
         )
 
+    def _autosave_tick(self, dt):
+        """Persists the current run's score to disk every few seconds while it's still
+        in progress, so a hard crash or forced kill doesn't lose it - not just the
+        explicit end-of-run/quit paths that finalize_score() already covers."""
+        if self._score_finalized or self.score <= 0 or self.score == self._last_autosaved_score:
+            return
+        self._autosave_accum += dt
+        if self._autosave_accum < 3.0:
+            return
+        self._autosave_accum = 0.0
+        self._last_autosaved_score = self.score
+        self.highscores = save_highscore(self.score, self.stage, endless=self.endless, run_id=self._run_id)
+
     # ---------------- pause ----------------
     def toggle_pause(self):
         if self.state in (STATE_PLAY, STATE_READY):
             self.pre_pause_state = self.state
             self.state = STATE_PAUSED
             set_cursor_locked(False)
+            play_sound("ui_click")
         elif self.state == STATE_PAUSED:
             self.state = self.pre_pause_state
             set_cursor_locked(True)
-        play_sound("ui_click")
+            self.resume_cooldown = 3.0
+            play_sound("countdown_tick")
+            return
 
     def restart_stage(self):
         log(f"Restarting Stage {self.stage} from the pause menu.")
@@ -1740,6 +1877,7 @@ class Game:
 
     # ---------------- update ----------------
     def update(self, dt, keys, mouse_pos, mouse_moved):
+        self._autosave_tick(dt)
         self.mouse_logical = mouse_pos
         if mouse_moved:
             self.mouse_control_active = True
@@ -1760,6 +1898,16 @@ class Game:
         # game ends doesn't freeze and render forever on the Game Over screen.
         if self.shake_time_left > 0:
             self.shake_time_left = max(0.0, self.shake_time_left - dt)
+
+        if self.resume_cooldown > 0 and self.state in (STATE_PLAY, STATE_READY):
+            prev_ceil = math.ceil(self.resume_cooldown)
+            self.resume_cooldown = max(0.0, self.resume_cooldown - dt)
+            new_ceil = math.ceil(self.resume_cooldown)
+            if self.resume_cooldown <= 0:
+                play_sound("countdown_go")
+            elif new_ceil != prev_ceil:
+                play_sound("countdown_tick")
+            return
 
         if self.state == STATE_READY:
             self.paddle.update(dt, keys, mouse_pos[0], self.mouse_control_active)
@@ -1959,11 +2107,16 @@ class Game:
             self.score += self.stage_clear_bonus
             self.state = STATE_STAGE_CLEAR
             play_sound("stage_clear")
-            update_progress(self.stage)
+            if not self.endless:
+                update_progress(self.stage)
             log(f"Stage {self.stage} cleared! Bonus: {self.stage_clear_bonus}")
 
     def next_stage(self):
         self.stage += 1
+        if self.endless:
+            log(f"Advancing to Endless Level {self.stage - TOTAL_STAGES}...")
+            self.load_stage(self.stage)
+            return
         if self.stage > TOTAL_STAGES:
             self.state = STATE_VICTORY
             play_sound("victory")
@@ -2011,16 +2164,23 @@ class Game:
         draw_text_center(
             screen, f"SCORE {self.score}", FONT_SMALL, CYAN, (round(150 * s), round(20 * s))
         )
+        stage_hud_text = (
+            f"ENDLESS - LVL {self.stage - TOTAL_STAGES}"
+            if self.endless
+            else f"STAGE {self.stage}/{TOTAL_STAGES}"
+        )
         draw_text_center(
             screen,
-            f"STAGE {self.stage}/{TOTAL_STAGES}",
+            stage_hud_text,
             FONT_SMALL,
             MAGENTA,
             (WIDTH // 2, round(20 * s)),
         )
-        lives_txt = "LIVES " + "♥ " * self.lives
+        hearts_shown = max(0, self.lives - 1)
+        lives_txt = ("LIVES " + "♥ " * hearts_shown).strip()
+        lives_color = heartbeat_color(pygame.time.get_ticks() / 1000.0) if hearts_shown == 0 else RED
         draw_text_center(
-            screen, lives_txt.strip(), FONT_SMALL, RED, (WIDTH - round(110 * s), round(20 * s))
+            screen, lives_txt, FONT_SMALL, lives_color, (WIDTH - round(110 * s), round(20 * s))
         )
 
         if self.time_expired:
@@ -2033,16 +2193,19 @@ class Game:
                 screen, f"{mm:02d}:{ss:02d}", FONT_SMALL, color, (WIDTH // 2, round(45 * s))
             )
 
-        # active effect indicators
+        # active effect indicators - duration is appended directly onto each tag
+        # (e.g. "WIDE 4.3s") so it shows right next to the boost it belongs to.
         tags = []
         if self.paddle.wide_timer > 0:
-            tags.append(("WIDE", GREEN))
+            tags.append((f"WIDE {self.paddle.wide_timer:.1f}s", GREEN))
         if self.paddle.shrink_timer > 0:
-            tags.append(("SHRUNK", RED))
-        if any(b.slow_timer > 0 for b in self.balls):
-            tags.append(("SLOW", BLUE))
-        if any(b.fast_timer > 0 for b in self.balls):
-            tags.append(("FAST", ORANGE))
+            tags.append((f"SHRUNK {self.paddle.shrink_timer:.1f}s", RED))
+        slow_left = max((b.slow_timer for b in self.balls if b.slow_timer > 0), default=0.0)
+        if slow_left > 0:
+            tags.append((f"SLOW {slow_left:.1f}s", BLUE))
+        fast_left = max((b.fast_timer for b in self.balls if b.fast_timer > 0), default=0.0)
+        if fast_left > 0:
+            tags.append((f"FAST {fast_left:.1f}s", ORANGE))
         if len(self.balls) > 1:
             tags.append((f"x{len(self.balls)} BALLS", MAGENTA))
         if not SFX_ON:
@@ -2084,30 +2247,41 @@ class Game:
         continue_label = f"CONTINUE (STAGE {max_stage})" if max_stage > 1 else "CONTINUE"
         buttons.append(("continue", Button(continue_rect, continue_label, enabled=max_stage > 1)))
 
+        stage_select_rect = pygame.Rect(0, 0, round(300 * s), round(46 * s))
+        stage_select_rect.center = (WIDTH // 2, round(275 * s))
+        buttons.append(
+            (
+                "stage_select",
+                Button(stage_select_rect, "STAGE SELECT", enabled=CONFIG.get("game_completed", False)),
+            )
+        )
+
         w, h = round(260 * s), round(54 * s)
         gap_x, gap_y = round(20 * s), round(14 * s)
         col_x = [WIDTH // 2 - w - gap_x // 2, WIDTH // 2 + gap_x // 2]
-        y0 = round(280 * s)
-        row_y = [y0, y0 + h + gap_y, y0 + 2 * (h + gap_y)]
+        row0_y = round(312 * s)
+        row1_y = row0_y + h + gap_y
+        row2_y = row1_y + h + gap_y
 
-        r = pygame.Rect(col_x[0], row_y[0], w, h)
+        r = pygame.Rect(col_x[0], row0_y, w, h)
         buttons.append(("highscores", Button(r, "CHECK HIGH SCORE")))
-        r = pygame.Rect(col_x[1], row_y[0], w, h)
+        r = pygame.Rect(col_x[1], row0_y, w, h)
         buttons.append(
-            ("stage_select", Button(r, "STAGE SELECT", enabled=CONFIG.get("game_completed", False)))
+            ("endless", Button(r, "ENDLESS MODE", enabled=CONFIG.get("game_completed", False)))
         )
 
-        r = pygame.Rect(col_x[0], row_y[1], w, h)
+        r = pygame.Rect(col_x[0], row1_y, w, h)
         buttons.append(
             ("fullscreen", Button(r, f"FULLSCREEN: {'ON' if CONFIG.get('fullscreen') else 'OFF'}"))
         )
-        r = pygame.Rect(col_x[1], row_y[1], w, h)
+        r = pygame.Rect(col_x[1], row1_y, w, h)
         buttons.append(("bgm", Button(r, f"BGM: {'ON' if BGM_ON else 'OFF'}")))
 
-        r = pygame.Rect(col_x[0], row_y[2], w, h)
+        r = pygame.Rect(col_x[0], row2_y, w, h)
         buttons.append(("sfx", Button(r, f"SOUND: {'ON' if SFX_ON else 'OFF'}")))
-        r = pygame.Rect(col_x[1], row_y[2], w, h)
+        r = pygame.Rect(col_x[1], row2_y, w, h)
         buttons.append(("quit", Button(r, "QUIT")))
+
         return buttons
 
     def build_highscores_buttons(self):
@@ -2152,9 +2326,9 @@ class Game:
         row_y = [y0, y0 + h + gap_y, y0 + 2 * (h + gap_y)]
 
         r = pygame.Rect(col_x[0], row_y[0], w, h)
-        buttons.append(("main_menu", Button(r, "MAIN MENU")))
-        r = pygame.Rect(col_x[1], row_y[0], w, h)
         buttons.append(("restart_stage", Button(r, "RESTART STAGE")))
+        r = pygame.Rect(col_x[1], row_y[0], w, h)
+        buttons.append(("sfx", Button(r, f"SOUND: {'ON' if SFX_ON else 'OFF'}")))
 
         r = pygame.Rect(col_x[0], row_y[1], w, h)
         buttons.append(
@@ -2163,16 +2337,10 @@ class Game:
         r = pygame.Rect(col_x[1], row_y[1], w, h)
         buttons.append(("bgm", Button(r, f"BGM: {'ON' if BGM_ON else 'OFF'}")))
 
-        r = pygame.Rect(col_x[0], row_y[2], w, h)
-        buttons.append(("sfx", Button(r, f"SOUND: {'ON' if SFX_ON else 'OFF'}")))
-        r = pygame.Rect(col_x[1], row_y[2], w, h)
-        buttons.append(
-            ("stage_select", Button(r, "STAGE SELECT", enabled=CONFIG.get("game_completed", False)))
-        )
+        main_menu_r = pygame.Rect(0, 0, round(320 * s), round(54 * s))
+        main_menu_r.center = (WIDTH // 2, row_y[2] + h // 2)
+        buttons.append(("main_menu", Button(main_menu_r, "MAIN MENU")))
 
-        quit_r = pygame.Rect(0, 0, round(320 * s), round(54 * s))
-        quit_r.center = (WIDTH // 2, row_y[2] + h + round(46 * s))
-        buttons.append(("quit", Button(quit_r, "QUIT")))
         return buttons
 
     def draw(self):
@@ -2201,14 +2369,14 @@ class Game:
                 "Arrows/A-D or Mouse to move  •  SPACE/Click to launch  •  P/ESC to pause",
                 FONT_TINY,
                 GRAY,
-                (WIDTH // 2, round(500 * s)),
+                (WIDTH // 2, round(532 * s)),
             )
             draw_text_center(
                 screen,
                 "Ctrl / Alt shows or hides the mouse cursor during play",
                 FONT_TINY,
                 GRAY,
-                (WIDTH // 2, round(522 * s)),
+                (WIDTH // 2, round(554 * s)),
             )
             draw_text_center(
                 screen,
@@ -2224,7 +2392,12 @@ class Game:
             )
             if self.highscores:
                 for i, entry in enumerate(self.highscores[:8]):
-                    line = f"{i + 1}. {entry['score']}   (stage {entry['stage']})"
+                    if entry.get("endless"):
+                        loop_num = max(1, entry["stage"] - TOTAL_STAGES)
+                        stage_label = f"Endless (loop {loop_num})"
+                    else:
+                        stage_label = f"Stage {entry['stage']}"
+                    line = f"{i + 1}.  {entry['score']}  -  {stage_label}"
                     draw_text_center(
                         screen, line, FONT_SMALL, WHITE, (WIDTH // 2, round((170 + i * 38) * s))
                     )
@@ -2262,9 +2435,14 @@ class Game:
             self.draw_hud()
             self.draw_pause_button()
             if self.state == STATE_READY:
+                ready_label = (
+                    f"ENDLESS - LEVEL {self.stage - TOTAL_STAGES}"
+                    if self.endless
+                    else f"STAGE {self.stage}"
+                )
                 draw_text_center(
                     screen,
-                    f"STAGE {self.stage}",
+                    ready_label,
                     FONT_MED,
                     YELLOW,
                     (WIDTH // 2, HEIGHT // 2 - round(20 * s)),
@@ -2282,6 +2460,26 @@ class Game:
                 screen.blit(overlay, (0, 0))
                 draw_text_center(screen, "PAUSED", FONT_BIG, CYAN, (WIDTH // 2, round(88 * s)))
                 self.draw_buttons(self.build_pause_buttons())
+            elif self.resume_cooldown > 0:
+                overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+                overlay.fill((0, 0, 0, 130))
+                screen.blit(overlay, (0, 0))
+                count = max(1, math.ceil(self.resume_cooldown))
+                draw_text_center(
+                    screen,
+                    str(count),
+                    FONT_BIG,
+                    CYAN,
+                    (WIDTH // 2, HEIGHT // 2),
+                    glow=(0, 60, 70),
+                )
+                draw_text_center(
+                    screen,
+                    "Get ready to move...",
+                    FONT_SMALL,
+                    WHITE,
+                    (WIDTH // 2, HEIGHT // 2 + round(60 * s)),
+                )
 
         elif self.state == STATE_STAGE_CLEAR:
             self.draw_play_elements()
@@ -2289,9 +2487,14 @@ class Game:
             overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
             overlay.fill((0, 0, 0, 160))
             screen.blit(overlay, (0, 0))
+            clear_title = (
+                f"ENDLESS LEVEL {self.stage - TOTAL_STAGES} CLEAR!"
+                if self.endless
+                else f"STAGE {self.stage} CLEAR!"
+            )
             draw_text_center(
                 screen,
-                f"STAGE {self.stage} CLEAR!",
+                clear_title,
                 FONT_BIG,
                 GREEN,
                 (WIDTH // 2, HEIGHT // 2 - round(50 * s)),
@@ -2304,11 +2507,14 @@ class Game:
                 YELLOW,
                 (WIDTH // 2, HEIGHT // 2 + round(10 * s)),
             )
-            nxt = (
-                "Press SPACE / Click for next stage"
-                if self.stage < TOTAL_STAGES
-                else "Press SPACE / Click to finish"
-            )
+            if self.endless:
+                nxt = "Press SPACE / Click for next level"
+            else:
+                nxt = (
+                    "Press SPACE / Click for next stage"
+                    if self.stage < TOTAL_STAGES
+                    else "Press SPACE / Click to finish"
+                )
             draw_text_center(
                 screen, nxt, FONT_SMALL, WHITE, (WIDTH // 2, HEIGHT // 2 + round(60 * s))
             )
@@ -2329,9 +2535,14 @@ class Game:
                 WHITE,
                 (WIDTH // 2, HEIGHT // 2 + round(5 * s)),
             )
+            reached_label = (
+                f"Reached Endless Level {self.stage - TOTAL_STAGES}"
+                if self.endless
+                else f"Reached Stage {self.stage}"
+            )
             draw_text_center(
                 screen,
-                f"Reached Stage {self.stage}",
+                reached_label,
                 FONT_SMALL,
                 MAGENTA,
                 (WIDTH // 2, HEIGHT // 2 + round(45 * s)),
@@ -2394,6 +2605,8 @@ class Game:
 
     # ---------------- input ----------------
     def handle_launch(self):
+        if self.resume_cooldown > 0:
+            return
         if self.state in (STATE_READY, STATE_PLAY):
             launched_any = False
             for b in self.balls:
@@ -2418,6 +2631,7 @@ class Game:
             self.next_stage()
 
     def quit_game(self):
+        self.finalize_score()
         if getattr(self, "_geometry_dirty", False):
             save_config(CONFIG)
         log("Quitting.")
@@ -2441,6 +2655,9 @@ class Game:
         elif action == "stage_select":
             if CONFIG.get("game_completed", False):
                 self.state = STATE_STAGE_SELECT
+        elif action == "endless":
+            if CONFIG.get("game_completed", False):
+                self.start_endless()
         elif action == "quit":
             self.quit_game()
         play_sound("ui_click")
@@ -2455,6 +2672,7 @@ class Game:
             elif self.state in (STATE_PLAY, STATE_READY, STATE_PAUSED):
                 self.toggle_pause()
             elif self.state in (STATE_GAME_OVER, STATE_VICTORY, STATE_STAGE_CLEAR):
+                self.finalize_score()
                 self.state = STATE_MENU
                 play_sound("ui_click")
             return
@@ -2464,7 +2682,10 @@ class Game:
             self.toggle_pause()
         if key == pygame.K_r and self.state in (STATE_GAME_OVER, STATE_VICTORY):
             log("Restart requested.")
-            self.reset_full()
+            if self.endless:
+                self.start_endless()
+            else:
+                self.reset_full()
         if key == pygame.K_m:
             quick_toggle_mute()
         if key in (pygame.K_LCTRL, pygame.K_RCTRL, pygame.K_LALT, pygame.K_RALT):
@@ -2508,6 +2729,7 @@ class Game:
                     if action == "resume":
                         self.toggle_pause()  # also re-hides the cursor
                     elif action == "main_menu":
+                        self.finalize_score()
                         self.state = STATE_MENU
                         play_sound("ui_click")
                     elif action == "restart_stage":
