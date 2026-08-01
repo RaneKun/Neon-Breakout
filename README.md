@@ -1,4 +1,4 @@
-# 🎮 NEON BREAKOUT
+# 🎮 [NEON BREAKOUT](https://ranekun.github.io/Neon-Breakout/)
 
 ![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)
 ![Pygame](https://img.shields.io/badge/pygame-2.0+-green.svg)
