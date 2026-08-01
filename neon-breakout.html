@@ -1,0 +1,2136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#08081a">
+<title>NEON BREAKOUT</title>
+<style>
+  :root{ --bg:#08081a; }
+  *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body{
+    margin:0; padding:0; width:100%; height:100%;
+    background:var(--bg);
+    overflow:hidden;
+    overscroll-behavior:none;
+    touch-action:none;
+    -webkit-user-select:none; user-select:none;
+    font-family:'Consolas','Courier New',monospace;
+  }
+  #stage{
+    position:fixed; inset:0;
+    display:flex; align-items:center; justify-content:center;
+    background:var(--bg);
+    touch-action:none;
+  }
+  #game{ display:block; touch-action:none; }
+  #loading{
+    position:fixed; inset:0; z-index:50;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    background:var(--bg); color:#3cf0ff;
+    letter-spacing:2px;
+    transition:opacity .5s ease;
+  }
+  #loading .title{ font-size:26px; font-weight:bold; color:#f0f0ff; text-shadow:0 0 18px #3cf0ffaa; }
+  #loading .sub{ margin-top:14px; font-size:13px; color:#889; opacity:.85; }
+  #loading .bar{ margin-top:22px; width:220px; height:4px; background:#ffffff22; border-radius:3px; overflow:hidden; }
+  #loading .bar-fg{ height:100%; width:0%; background:#3cf0ff; box-shadow:0 0 10px #3cf0ff; transition:width .2s ease; }
+  #loading.hidden{ opacity:0; pointer-events:none; }
+  #rotate-prompt{
+    position:fixed; inset:0; z-index:45;
+    display:none; flex-direction:column; align-items:center; justify-content:center;
+    background:var(--bg); color:#f0f0ff; text-align:center; padding:24px;
+    gap:14px;
+  }
+  #rotate-prompt.visible{ display:flex; }
+  #rotate-prompt svg{ width:64px; height:64px; animation:rot-spin 1.8s ease-in-out infinite; }
+  @keyframes rot-spin{
+    0%,20%{ transform:rotate(0deg); } 50%,70%{ transform:rotate(-90deg); } 100%{ transform:rotate(-90deg); }
+  }
+  #rotate-prompt .rt{ font-size:18px; font-weight:bold; letter-spacing:1px; }
+  #rotate-prompt .rs{ font-size:13px; color:#889; }
+  canvas{ outline:none; }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="game"></canvas>
+  </div>
+  <div id="loading">
+    <div class="title">NEON BREAKOUT</div>
+    <div class="sub" id="loading-sub">initializing...</div>
+    <div class="bar"><div class="bar-fg" id="loading-bar"></div></div>
+  </div>
+  <div id="rotate-prompt">
+    <svg viewBox="0 0 24 24" fill="none" stroke="#3cf0ff" stroke-width="1.6"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="10" y1="19" x2="14" y2="19"/></svg>
+    <div class="rt">ROTATE YOUR DEVICE</div>
+    <div class="rs">Neon Breakout plays in landscape</div>
+  </div>
+
+<script>
+"use strict";
+/* ==========================================================================
+   NEON BREAKOUT - web port
+   Faithful port of the Python/Pygame original: procedurally generated audio
+   (Web Audio API, no external assets), fixed-landscape logical canvas scaled
+   to fit any screen, persistent config + high scores (localStorage), full
+   button-driven menu, pause system, keyboard/mouse controls plus a touch
+   layer for mobile. Portrait phones get a rotate prompt (landscape-native
+   game, unlike the portrait-native Void Breaker).
+   ========================================================================== */
+
+const log = (...a) => { try { console.log("[NB]", ...a); } catch(e){} };
+
+// --------------------------------------------------------------------------
+// SEEDED RNG - used for deterministic per-stage brick layouts (numbered
+// stages replay identically every time, matching the original's seeded
+// random.Random(stage*7919+13)). Endless mode uses plain Math.random(),
+// matching the original's unseeded layouts there.
+// --------------------------------------------------------------------------
+function makeSeededRng(seed){
+  let s = seed >>> 0;
+  return function(){
+    s |= 0; s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function rngInt(rng, min, max){ return min + Math.floor(rng() * (max - min + 1)); } // inclusive both ends, matches Python randint
+function choice(arr, rng){ const r = rng ? rng() : Math.random(); return arr[Math.floor(r * arr.length)]; }
+function randRange([a, b], rng){ const r = rng ? rng() : Math.random(); return a + r * (b - a); }
+function weightedChoice(items, weights, rng){
+  const total = weights.reduce((a, b) => a + b, 0);
+  if (total <= 0) return items[items.length - 1];
+  let r = (rng ? rng() : Math.random()) * total;
+  for (let i = 0; i < items.length; i++){
+    r -= weights[i];
+    if (r <= 0) return items[i];
+  }
+  return items[items.length - 1];
+}
+
+// --------------------------------------------------------------------------
+// PERSISTENCE (config + high scores) - localStorage, with an in-memory
+// fallback so the game still runs perfectly if storage is blocked.
+// --------------------------------------------------------------------------
+const STORAGE_PREFIX = "neonbreakout.";
+const _memStore = {};
+const storage = {
+  get(key){
+    try { const v = window.localStorage.getItem(STORAGE_PREFIX + key); return v === null ? undefined : v; }
+    catch(e){ return _memStore[key]; }
+  },
+  set(key, val){
+    try { window.localStorage.setItem(STORAGE_PREFIX + key, val); }
+    catch(e){ _memStore[key] = val; }
+  }
+};
+
+const MAX_HIGHSCORES = 10;
+const DEFAULT_CONFIG = {
+  max_stage_reached: 1,
+  game_completed: false,
+  bgm_on: true,
+  sfx_on: true,
+  fullscreen: false,
+};
+
+function loadConfig(){
+  const cfg = Object.assign({}, DEFAULT_CONFIG);
+  try {
+    const raw = storage.get("config");
+    if (raw){
+      const data = JSON.parse(raw);
+      if (data && typeof data === "object") for (const k in DEFAULT_CONFIG) if (k in data) cfg[k] = data[k];
+    }
+  } catch(e){ /* corrupt/missing - use defaults */ }
+  return cfg;
+}
+function saveConfig(cfg){ try { storage.set("config", JSON.stringify(cfg)); } catch(e){ log("Failed to save config", e); } }
+
+function loadHighscores(){
+  try {
+    const raw = storage.get("scores");
+    if (!raw) return [];
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data)) return [];
+    let cleaned = data.filter(e => e && typeof e === "object" && "score" in e && "stage" in e);
+    cleaned.forEach(e => { if (!("endless" in e)) e.endless = false; });
+    cleaned.sort((a,b) => b.score - a.score);
+    return cleaned.slice(0, MAX_HIGHSCORES);
+  } catch(e){ return []; }
+}
+function saveHighscore(score, stage, endless=false, runId=null){
+  let scores = loadHighscores();
+  if (runId !== null) scores = scores.filter(e => e.run_id !== runId);
+  const entry = { score, stage, endless };
+  if (runId !== null) entry.run_id = runId;
+  scores.push(entry);
+  scores.sort((a,b) => b.score - a.score);
+  scores = scores.slice(0, MAX_HIGHSCORES);
+  try { storage.set("scores", JSON.stringify(scores)); } catch(e){ log("Failed to save high scores", e); }
+  return scores;
+}
+function updateProgress(CONFIG, stageCleared){
+  let changed = false;
+  const nextStage = Math.min(TOTAL_STAGES, stageCleared + 1);
+  if (nextStage > (CONFIG.max_stage_reached || 1)) { CONFIG.max_stage_reached = nextStage; changed = true; }
+  if (stageCleared >= TOTAL_STAGES && !CONFIG.game_completed) { CONFIG.game_completed = true; changed = true; }
+  if (changed) saveConfig(CONFIG);
+}
+
+const CONFIG = loadConfig();
+let SFX_ON = !!CONFIG.sfx_on;
+let BGM_ON = !!CONFIG.bgm_on;
+
+// --------------------------------------------------------------------------
+// RESOLUTION - fixed landscape logical canvas (matches the original's design
+// resolution). Scaled to fit any screen via CSS, DPR-aware for crispness.
+// --------------------------------------------------------------------------
+const DESIGN_W = 1000, DESIGN_H = 700;
+const DESIGN_RATIO = DESIGN_W / DESIGN_H; // 10:7 ~= 1.4286
+let WIDTH = DESIGN_W, HEIGHT = DESIGN_H;
+const TOTAL_STAGES = 10;
+
+// Aspect ratios from 5:4 up through 16:9 all fill the screen completely
+// (spanning - and including - the design ratio itself); anything more
+// extreme (21:9, 32:9 ultrawide, or unusually narrow/tall) falls back to a
+// fixed 1000x700 with standard letterbox/pillarbox instead of stretching.
+const FILL_MIN_RATIO = 5 / 4;   // 1.25
+const FILL_MAX_RATIO = 16 / 9;  // ~1.7778
+
+function computeDynamicResolution(vw, vh){
+  if (!(vw > 0) || !(vh > 0)) return { w: DESIGN_W, h: DESIGN_H };
+  const viewportRatio = vw / vh;
+  if (viewportRatio < FILL_MIN_RATIO || viewportRatio > FILL_MAX_RATIO) return { w: DESIGN_W, h: DESIGN_H };
+  if (viewportRatio >= DESIGN_RATIO) return { w: Math.round(DESIGN_H * viewportRatio), h: DESIGN_H };
+  return { w: DESIGN_W, h: Math.round(DESIGN_W / viewportRatio) };
+}
+
+// Only called at safe "fresh layout" boundaries (boot, loadStage) - never
+// mid-stage - so bricks/paddle/HUD are always laid out against dimensions
+// that are about to be used for a brand new layout anyway, never yanked out
+// from under an already-placed brick field.
+function applyDynamicResolution(){
+  const vw = stageEl ? stageEl.clientWidth : window.innerWidth;
+  const vh = stageEl ? stageEl.clientHeight : window.innerHeight;
+  const res = computeDynamicResolution(vw, vh);
+  WIDTH = res.w; HEIGHT = res.h;
+  PADDLE_Y = HEIGHT - 50;
+  if (typeof initStars === "function") initStars();
+  if (typeof resizeCanvas === "function") resizeCanvas();
+}
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d", { alpha: false });
+const FPS = 60;
+
+// ---- Neon color palette (exact match to the original) -------------------
+const BG_COLOR   = [8, 8, 18];
+const BG_COLOR2  = [14, 10, 28];
+const GRID_LINE  = [28, 22, 48];
+
+const CYAN    = [60, 240, 255];
+const MAGENTA = [255, 70, 230];
+const YELLOW  = [255, 235, 60];
+const GREEN   = [80, 255, 140];
+const ORANGE  = [255, 150, 50];
+const RED     = [255, 70, 90];
+const PURPLE  = [170, 90, 255];
+const BLUE    = [80, 150, 255];
+const WHITE   = [240, 240, 255];
+const GRAY    = [120, 125, 140];
+
+const HP_COLORS = { 1: CYAN, 2: YELLOW, 3: ORANGE, 4: RED };
+
+function rgb(c, a){ return a === undefined ? `rgb(${c[0]},${c[1]},${c[2]})` : `rgba(${c[0]},${c[1]},${c[2]},${a})`; }
+
+const FONT_BIG   = "bold 64px Consolas, 'Courier New', monospace";
+const FONT_MED   = "bold 34px Consolas, 'Courier New', monospace";
+const FONT_SMALL = "bold 20px Consolas, 'Courier New', monospace";
+const FONT_TINY  = "15px Consolas, 'Courier New', monospace";
+
+const POWERUP_INFO = {
+  widen:     { letter: "W", color: GREEN,   weight: 4 },
+  multiball: { letter: "M", color: MAGENTA, weight: 6 },
+  slow:      { letter: "S", color: BLUE,    weight: 5 },
+  life:      { letter: "+", color: WHITE,   weight: 5 },
+  shrink:    { letter: "-", color: RED,     weight: 4 },
+  fast:      { letter: "F", color: ORANGE,  weight: 5 },
+};
+const POWERUP_KEYS = Object.keys(POWERUP_INFO);
+const GOOD_POWERUPS = new Set(["widen", "multiball", "life"]);
+
+// frame-rate-independent "close X% of the gap per tick, assumed 60fps" helper.
+function approachFactor(perTickFactor, dt){ return 1 - Math.pow(1 - perTickFactor, dt * 60); }
+function decay60(factorPerTickAt60, dt){ return Math.pow(factorPerTickAt60, dt * 60); }
+
+// --------------------------------------------------------------------------
+// AUDIO ENGINE - all procedural, no external files. SFX build fast and
+// synchronously; the ~2 minute generative music track builds in small
+// per-bar chunks in the background (learned the hard way on Void Breaker:
+// building it in one big synchronous block freezes the page even if you
+// "defer" when it starts - it still blocks once it starts).
+// --------------------------------------------------------------------------
+const SAMPLE_RATE = 44100;
+let audioCtx = null;
+let SOUND_ENABLED = true;
+const SOUNDS = {};
+let musicBuffer = null;
+let musicSource = null;
+let musicGain = null;
+let sfxGain = null;
+let _audioUnlocked = false;
+
+function midiToFreq(m){ return 440.0 * Math.pow(2, (m - 69) / 12); }
+
+function linspace(start, stop, num, endpoint = true){
+  const out = new Float64Array(Math.max(0, num));
+  if (num <= 0) return out;
+  if (num === 1) { out[0] = start; return out; }
+  const denom = endpoint ? (num - 1) : num;
+  const step = (stop - start) / denom;
+  for (let i = 0; i < num; i++) out[i] = start + step * i;
+  return out;
+}
+
+// ---- basic tone/sweep generators, used for one-off SFX -------------------
+function toneArray(freq, dur, wave = "square", vol = 0.35, fade = true){
+  const n = Math.max(1, Math.floor(SAMPLE_RATE * dur));
+  const data = new Float64Array(n);
+  for (let i = 0; i < n; i++){
+    const t = i * dur / n;
+    let v;
+    if (wave === "square") v = Math.sign(Math.sin(2*Math.PI*freq*t));
+    else if (wave === "saw") v = 2*(t*freq - Math.floor(0.5 + t*freq));
+    else if (wave === "tri") v = 2*Math.abs(2*(t*freq - Math.floor(t*freq + 0.5))) - 1;
+    else if (wave === "noise") v = Math.random()*2 - 1;
+    else v = Math.sin(2*Math.PI*freq*t);
+    data[i] = v;
+  }
+  if (fade){
+    const fl = Math.max(1, Math.floor(n*0.25));
+    const fadeEnv = linspace(1, 0, fl);
+    for (let i = 0; i < fl; i++) data[n-fl+i] *= fadeEnv[i];
+  }
+  for (let i = 0; i < n; i++) data[i] *= vol;
+  return data;
+}
+
+function sweepArray(f0, f1, dur, wave = "square", vol = 0.35){
+  const n = Math.max(1, Math.floor(SAMPLE_RATE * dur));
+  const data = new Float64Array(n);
+  const freqEnv = linspace(f0, f1, n);
+  let phase = 0;
+  for (let i = 0; i < n; i++){
+    phase += 2*Math.PI*freqEnv[i]/SAMPLE_RATE;
+    data[i] = wave === "square" ? Math.sign(Math.sin(phase)) : Math.sin(phase);
+  }
+  const fl = Math.max(1, Math.floor(n*0.3));
+  const fadeEnv = linspace(1, 0, fl);
+  for (let i = 0; i < fl; i++) data[n-fl+i] *= fadeEnv[i];
+  for (let i = 0; i < n; i++) data[i] *= vol;
+  return data;
+}
+
+function concatArrays(...arrays){
+  const total = arrays.reduce((s,a) => s+a.length, 0);
+  const out = new Float64Array(total);
+  let off = 0;
+  for (const a of arrays){ out.set(a, off); off += a.length; }
+  return out;
+}
+function sumArrays(...arrays){
+  const n = Math.max(...arrays.map(a => a.length));
+  const out = new Float64Array(n);
+  for (const a of arrays) for (let i=0;i<a.length;i++) out[i] += a[i];
+  return out;
+}
+
+function toAudioBuffer(mono){
+  const n = mono.length;
+  const buf = audioCtx.createBuffer(2, Math.max(1,n), SAMPLE_RATE);
+  const ch0 = buf.getChannelData(0), ch1 = buf.getChannelData(1);
+  for (let i = 0; i < n; i++){
+    let v = mono[i];
+    if (v > 1) v = 1; else if (v < -1) v = -1;
+    ch0[i] = v; ch1[i] = v;
+  }
+  return buf;
+}
+
+function arpeggioSound(freqs, noteDur = 0.09, wave = "square", vol = 0.3){
+  return toAudioBuffer(concatArrays(...freqs.map(f => toneArray(f, noteDur, wave, vol))));
+}
+
+function buildSounds(){
+  return {
+    wall: toAudioBuffer(toneArray(220, 0.05, "square", 0.22)),
+    paddle: toAudioBuffer(toneArray(330, 0.06, "square", 0.28)),
+    corner_hit: toAudioBuffer(sweepArray(500, 950, 0.09, "square", 0.34)),
+    launch: toAudioBuffer(toneArray(600, 0.08, "square", 0.3)),
+    brick_hit: toAudioBuffer(toneArray(520, 0.05, "square", 0.22)),
+    brick_break: toAudioBuffer(sweepArray(700, 260, 0.12, "square", 0.3)),
+    powerup_good: toAudioBuffer(sweepArray(400, 950, 0.18, "square", 0.35)),
+    powerup_bad: toAudioBuffer(sweepArray(500, 180, 0.18, "square", 0.3)),
+    life_lost: toAudioBuffer(sweepArray(420, 110, 0.35, "saw", 0.35)),
+    ui_click: toAudioBuffer(toneArray(440, 0.05, "square", 0.22)),
+    stage_clear: arpeggioSound([523, 659, 784, 1047], 0.09, "square", 0.32),
+    victory: arpeggioSound([523, 659, 784, 1047, 1319], 0.12, "square", 0.34),
+    game_over: toAudioBuffer(sweepArray(320, 55, 0.6, "saw", 0.4)),
+    timeout: toAudioBuffer(sweepArray(200, 650, 0.4, "saw", 0.32)),
+    laser_charge: toAudioBuffer(sweepArray(180, 420, 0.5, "sine", 0.22)),
+    laser_fire: toAudioBuffer(sweepArray(900, 120, 0.22, "saw", 0.4)),
+    laser_hit: toAudioBuffer(sweepArray(500, 90, 0.4, "saw", 0.42)),
+    countdown_tick: toAudioBuffer(toneArray(660, 0.09, "square", 0.28)),
+    countdown_go: arpeggioSound([660, 988], 0.1, "square", 0.32),
+  };
+}
+
+// ---- generative background music: ~2 minutes of synthwave/chiptune -------
+const MUSIC_BPM = 128;
+const STEP_DUR = 60.0 / MUSIC_BPM / 4.0;
+const BAR_DUR = STEP_DUR * 16;
+
+const CHORDS = [[57,60,64],[53,57,60],[60,64,67],[55,59,62]]; // Am - F - C - G
+const ROOTS = [45, 41, 48, 43];
+
+const KICK_4ONFLOOR = [0,4,8,12];
+const KICK_8TH = [0,2,4,6,8,10,12,14];
+const KICK_HALFTIME = [0,8];
+const HAT_OFFBEAT = [2,6,10,14];
+const HAT_8TH = [0,2,4,6,8,10,12,14];
+const HAT_SPARSE = [0,8];
+const SNARE_BACKBEAT = [4,12];
+const BASS_QUARTER = [0,4,8,12];
+const BASS_SYNC = [0,3,6,8,11,14];
+const BASS_EIGHTH = [0,2,4,6,8,10,12,14];
+
+const VERSE_LEAD = [
+  [[2,0,0],[6,1,0],[10,2,0],[14,1,0]],
+  [[0,0,0],[4,2,0],[8,1,0],[12,0,12]],
+  [[2,1,0],[6,0,0],[10,2,0],[14,0,0]],
+  [[0,2,0],[4,1,0],[8,0,0],[12,2,0]],
+];
+const CHORUS_LEAD = [
+  [[0,0,0],[2,1,0],[4,2,0],[6,1,0],[8,0,12],[10,1,0],[12,2,0],[14,1,0]],
+  [[0,0,0],[2,2,0],[4,1,0],[6,0,0],[8,2,12],[10,0,0],[12,1,0],[14,2,0]],
+  [[0,1,0],[2,0,0],[4,2,0],[6,0,0],[8,1,12],[10,2,0],[12,0,0],[14,1,0]],
+  [[0,2,0],[2,1,0],[4,0,0],[6,2,0],[8,0,12],[10,1,0],[12,2,0],[14,0,0]],
+];
+const VERSEB_LEAD = [
+  [[0,0,0],[3,1,0],[7,2,0],[11,1,0],[14,0,12]],
+  [[0,0,0],[3,2,0],[7,1,0],[11,0,0],[14,2,12]],
+  [[0,1,0],[3,0,0],[7,2,0],[11,0,0],[14,1,0]],
+  [[0,2,0],[3,1,0],[7,0,0],[11,2,0],[14,0,12]],
+];
+const BREAKDOWN_LEAD = [
+  [[0,0,12],[4,1,12],[8,2,12],[12,1,12]],
+  [[0,0,12],[4,2,12],[8,1,12],[12,0,24]],
+  [[0,1,12],[4,0,12],[8,2,12],[12,0,12]],
+  [[0,2,12],[4,1,12],[8,0,12],[12,2,12]],
+];
+const CHORUSB_LEAD = [
+  [[0,0,0],[2,2,0],[4,1,0],[6,2,0],[8,0,12],[10,2,0],[12,1,0],[14,0,12]],
+  [[0,1,0],[2,0,0],[4,2,0],[6,1,0],[8,2,12],[10,0,0],[12,2,0],[14,1,0]],
+  [[0,2,0],[2,1,0],[4,0,0],[6,1,0],[8,1,12],[10,2,0],[12,0,0],[14,2,0]],
+  [[0,0,0],[2,2,0],[4,0,0],[6,2,0],[8,1,12],[10,0,0],[12,1,0],[14,2,0]],
+];
+const BRIDGE_LEAD = [
+  [[0,0,0],[8,1,0]],
+  [[0,0,0],[8,2,0]],
+  [[0,1,0],[8,0,0]],
+  [[0,2,0],[8,1,12]],
+];
+const FINALE_LEAD = [
+  [[0,0,0],[2,1,0],[4,2,0],[6,0,12],[8,1,0],[10,2,0],[12,0,0],[14,1,12]],
+  [[0,0,0],[2,2,0],[4,1,0],[6,0,12],[8,2,0],[10,1,0],[12,0,0],[14,2,12]],
+  [[0,1,0],[2,0,0],[4,2,0],[6,1,12],[8,0,0],[10,2,0],[12,1,0],[14,0,12]],
+  [[0,2,0],[2,1,0],[4,0,0],[6,2,12],[8,1,0],[10,0,0],[12,2,0],[14,1,12]],
+];
+
+function synthNote(freq, dur, wave = "square", vol = 0.16, attack = 0.006, release = 0.03){
+  const n = Math.max(1, Math.floor(SAMPLE_RATE * dur));
+  const data = new Float64Array(n);
+  const a = dur > 0 ? Math.min(n, Math.max(1, Math.floor(n*attack/dur))) : 1;
+  const r = dur > 0 ? Math.min(Math.max(0, n-a), Math.max(1, Math.floor(n*release/dur))) : 0;
+  const relStart = n - r;
+  const twoPiFreq = 2*Math.PI*freq;
+  const dtSample = dur > 0 ? (dur/n) : 0;
+  for (let i = 0; i < n; i++){
+    const t = i*dtSample;
+    let v;
+    if (wave === "square") v = Math.sign(Math.sin(twoPiFreq*t));
+    else if (wave === "saw") v = 2*(t*freq - Math.floor(0.5 + t*freq));
+    else if (wave === "tri") v = 2*Math.abs(2*(t*freq - Math.floor(t*freq + 0.5))) - 1;
+    else v = Math.sin(twoPiFreq*t);
+    let env = 1;
+    if (i < a) env = a > 1 ? i/(a-1) : 0;
+    if (r > 0 && i >= relStart) env = r > 1 ? (n-1-i)/(r-1) : 1;
+    data[i] = v*env*vol;
+  }
+  return data;
+}
+
+function synthKick(vol = 0.42, dur = 0.16){
+  const n = Math.floor(SAMPLE_RATE*dur);
+  const data = new Float64Array(n);
+  const freqEnv = linspace(150, 45, n);
+  let phase = 0;
+  for (let i = 0; i < n; i++){
+    phase += 2*Math.PI*freqEnv[i]/SAMPLE_RATE;
+    const t = i*dur/n;
+    data[i] = Math.sin(phase) * Math.exp(-t*16) * vol;
+  }
+  return data;
+}
+function synthHat(vol = 0.12, dur = 0.045){
+  const n = Math.floor(SAMPLE_RATE*dur);
+  const data = new Float64Array(n);
+  const ampArr = linspace(0, 1, n);
+  for (let i = 0; i < n; i++) data[i] = (Math.random()*2-1) * Math.exp(-ampArr[i]*13) * vol;
+  return data;
+}
+function synthSnare(vol = 0.24, dur = 0.09){
+  const n = Math.floor(SAMPLE_RATE*dur);
+  const data = new Float64Array(n);
+  const ampArr = linspace(0, 1, n);
+  const tone = synthNote(190, dur, "tri", vol*0.5);
+  for (let i = 0; i < n; i++){
+    const noise = Math.random()*2-1;
+    data[i] = noise * Math.exp(-ampArr[i]*10) * vol * 0.7 + (tone[i] || 0);
+  }
+  return data;
+}
+function mixInto(buf, startSample, sound){
+  if (startSample >= buf.length || sound.length === 0) return;
+  let end = startSample + sound.length;
+  let n = sound.length;
+  if (end > buf.length){ n = buf.length - startSample; end = buf.length; }
+  for (let i = 0; i < n; i++) buf[startSample+i] += sound[i];
+}
+
+const SECTION_DEFS = [
+  { bars:4, pad:true, bassSteps:BASS_QUARTER, hatSteps:HAT_SPARSE, bassVol:0.09, hatVol:0.05, padVol:0.04 },
+  { bars:8, kickSteps:KICK_4ONFLOOR, hatSteps:HAT_OFFBEAT, bassSteps:BASS_SYNC, leadNotes:VERSE_LEAD, pad:true, padVol:0.03, leadVol:0.13, bassVol:0.13, kickVol:0.32, hatVol:0.08 },
+  { bars:8, kickSteps:KICK_8TH, hatSteps:HAT_8TH, snareSteps:SNARE_BACKBEAT, bassSteps:BASS_EIGHTH, leadNotes:CHORUS_LEAD, leadVol:0.16, bassVol:0.15, kickVol:0.4, hatVol:0.1, snareVol:0.2 },
+  { bars:8, kickSteps:KICK_4ONFLOOR, hatSteps:HAT_OFFBEAT, snareSteps:SNARE_BACKBEAT, bassSteps:BASS_SYNC, leadNotes:VERSEB_LEAD, pad:true, padVol:0.03, leadVol:0.13, bassVol:0.13, kickVol:0.34, hatVol:0.08, snareVol:0.15 },
+  { bars:8, hatSteps:HAT_SPARSE, leadNotes:BREAKDOWN_LEAD, pad:true, leadWave:"tri", padVol:0.05, leadVol:0.15, hatVol:0.05 },
+  { bars:8, kickSteps:KICK_8TH, hatSteps:HAT_8TH, snareSteps:SNARE_BACKBEAT, bassSteps:BASS_EIGHTH, leadNotes:CHORUSB_LEAD, leadVol:0.16, bassVol:0.15, kickVol:0.4, hatVol:0.1, snareVol:0.2 },
+  { bars:8, kickSteps:KICK_HALFTIME, hatSteps:HAT_SPARSE, bassSteps:[0,8], leadNotes:BRIDGE_LEAD, pad:true, leadWave:"tri", padVol:0.05, leadVol:0.14, bassVol:0.12, kickVol:0.28, hatVol:0.05, chords:[CHORDS[2],CHORDS[3],CHORDS[0],CHORDS[1]], roots:[ROOTS[2],ROOTS[3],ROOTS[0],ROOTS[1]] },
+  { bars:8, kickSteps:KICK_8TH, hatSteps:HAT_8TH, snareSteps:SNARE_BACKBEAT, bassSteps:BASS_EIGHTH, leadNotes:FINALE_LEAD, leadVol:0.18, bassVol:0.16, kickVol:0.44, hatVol:0.11, snareVol:0.22 },
+  { bars:4, pad:true, bassSteps:BASS_QUARTER, hatSteps:HAT_SPARSE, bassVol:0.08, hatVol:0.04, padVol:0.035 },
+];
+
+function buildBarSpecs(){
+  const specs = [];
+  for (const sec of SECTION_DEFS){
+    const chords = sec.chords || CHORDS;
+    const roots = sec.roots || ROOTS;
+    for (let barI = 0; barI < sec.bars; barI++){
+      specs.push({
+        chord: chords[barI % chords.length],
+        root: roots[barI % roots.length],
+        kickSteps: sec.kickSteps || null,
+        hatSteps: sec.hatSteps || null,
+        snareSteps: sec.snareSteps || null,
+        bassSteps: sec.bassSteps || null,
+        leadNotes: sec.leadNotes || null,
+        pad: !!sec.pad,
+        leadWave: sec.leadWave || "square",
+        bassWave: sec.bassWave || "square",
+        leadVol: sec.leadVol ?? 0.14,
+        bassVol: sec.bassVol ?? 0.15,
+        padVol: sec.padVol ?? 0.045,
+        kickVol: sec.kickVol ?? 0.4,
+        hatVol: sec.hatVol ?? 0.11,
+        snareVol: sec.snareVol ?? 0.22,
+        leadOctave: sec.leadOctave || 0,
+        barIndexInSection: barI,
+      });
+    }
+  }
+  return specs;
+}
+
+function renderBarIntoBuffer(buf, totalSamples, barGlobalIndex, spec){
+  const barStart = Math.floor(barGlobalIndex * BAR_DUR * SAMPLE_RATE);
+  const { chord, root } = spec;
+
+  if (spec.pad){
+    const chordWave = sumArrays(...chord.map(t => synthNote(midiToFreq(t), BAR_DUR*0.96, "sine", spec.padVol, 0.25, 0.5)));
+    mixInto(buf, barStart, chordWave);
+  }
+  if (spec.kickSteps) for (const step of spec.kickSteps) mixInto(buf, barStart + Math.floor(step*STEP_DUR*SAMPLE_RATE), synthKick(spec.kickVol));
+  if (spec.snareSteps) for (const step of spec.snareSteps) mixInto(buf, barStart + Math.floor(step*STEP_DUR*SAMPLE_RATE), synthSnare(spec.snareVol));
+  if (spec.hatSteps) for (const step of spec.hatSteps) mixInto(buf, barStart + Math.floor(step*STEP_DUR*SAMPLE_RATE), synthHat(spec.hatVol));
+  if (spec.bassSteps){
+    const freq = midiToFreq(root);
+    for (const step of spec.bassSteps){
+      mixInto(buf, barStart + Math.floor(step*STEP_DUR*SAMPLE_RATE), synthNote(freq, STEP_DUR*1.9, spec.bassWave, spec.bassVol, 0.004, 0.05));
+    }
+  }
+  if (spec.leadNotes){
+    const pattern = Array.isArray(spec.leadNotes[0]) ? spec.leadNotes[spec.barIndexInSection % spec.leadNotes.length] : spec.leadNotes;
+    for (const [step, degree, extra] of pattern){
+      const tone = chord[degree % chord.length] + 12*spec.leadOctave + extra;
+      const freq = midiToFreq(tone);
+      mixInto(buf, barStart + Math.floor(step*STEP_DUR*SAMPLE_RATE), synthNote(freq, STEP_DUR*1.4, spec.leadWave, spec.leadVol, 0.003, 0.04));
+    }
+  }
+}
+
+let _musicBuilding = false;
+function buildMusicTrackChunked(onDone){
+  const specs = buildBarSpecs();
+  const totalBars = specs.length; // 64
+  const totalSamples = Math.floor(totalBars * BAR_DUR * SAMPLE_RATE);
+  const buf = new Float64Array(totalSamples + SAMPLE_RATE);
+
+  const BARS_PER_CHUNK = 2;
+  let i = 0;
+  function step(){
+    const chunkEnd = Math.min(totalBars, i + BARS_PER_CHUNK);
+    for (; i < chunkEnd; i++) renderBarIntoBuffer(buf, totalSamples, i, specs[i]);
+    if (i < totalBars) setTimeout(step, 0);
+    else onDone(toAudioBuffer(buf.subarray(0, totalSamples)));
+  }
+  setTimeout(step, 0);
+}
+
+// ---- playback control ------------------------------------------------
+function ensureAudioContext(){
+  if (audioCtx) return audioCtx;
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    sfxGain = audioCtx.createGain(); sfxGain.gain.value = SFX_ON ? 1 : 0; sfxGain.connect(audioCtx.destination);
+    musicGain = audioCtx.createGain(); musicGain.gain.value = BGM_ON ? 0.35 : 0; musicGain.connect(audioCtx.destination);
+  } catch(e){ SOUND_ENABLED = false; log("Web Audio unavailable", e); }
+  return audioCtx;
+}
+function buildSfxAssets(){
+  if (!SOUND_ENABLED) return;
+  try {
+    ensureAudioContext();
+    if (!audioCtx) return;
+    Object.assign(SOUNDS, buildSounds());
+  } catch(e){ SOUND_ENABLED = false; log("Sound engine failed to initialize", e); }
+}
+function buildMusicAsync(onDone){
+  if (!SOUND_ENABLED || !audioCtx || _musicBuilding || musicBuffer){ onDone && onDone(); return; }
+  _musicBuilding = true;
+  buildMusicTrackChunked((buffer) => {
+    musicBuffer = buffer;
+    _musicBuilding = false;
+    if (_audioUnlocked) startMusic();
+    onDone && onDone();
+  });
+}
+function playSound(name){
+  if (!SOUND_ENABLED || !SFX_ON || !audioCtx) return;
+  const buf = SOUNDS[name];
+  if (!buf) return;
+  try { const src = audioCtx.createBufferSource(); src.buffer = buf; src.connect(sfxGain); src.start(); } catch(e){}
+}
+function startMusic(){
+  if (!SOUND_ENABLED || !audioCtx || !musicBuffer || musicSource) return;
+  try {
+    musicSource = audioCtx.createBufferSource();
+    musicSource.buffer = musicBuffer;
+    musicSource.loop = true;
+    musicSource.connect(musicGain);
+    musicSource.start();
+  } catch(e){}
+}
+function unlockAudio(){
+  if (_audioUnlocked) return;
+  _audioUnlocked = true;
+  ensureAudioContext();
+  if (!audioCtx) return;
+  if (audioCtx.state === "suspended") audioCtx.resume().then(startMusic).catch(startMusic);
+  else startMusic();
+}
+function setSfx(on){ SFX_ON = on; CONFIG.sfx_on = on; saveConfig(CONFIG); }
+function setBgm(on){ BGM_ON = on; CONFIG.bgm_on = on; if (musicGain) musicGain.gain.value = on?0.35:0; saveConfig(CONFIG); }
+function quickToggleMute(){ const turnOn = !(SFX_ON || BGM_ON); setSfx(turnOn); setBgm(turnOn); }
+
+// --------------------------------------------------------------------------
+// CANVAS SETUP - fixed logical 1000x700 buffer, scaled via CSS to fit any
+// viewport while preserving aspect ratio, DPR-aware for crisp text/edges.
+// --------------------------------------------------------------------------
+const stageEl = document.getElementById("stage");
+let dpr = Math.max(1, window.devicePixelRatio || 1);
+
+function resizeCanvas(){
+  dpr = Math.max(1, window.devicePixelRatio || 1);
+  const vw = stageEl.clientWidth, vh = stageEl.clientHeight;
+  const scale = Math.max(0.0001, Math.min(vw / WIDTH, vh / HEIGHT));
+  const cssW = Math.max(1, Math.floor(WIDTH * scale));
+  const cssH = Math.max(1, Math.floor(HEIGHT * scale));
+  canvas.style.width = cssW + "px";
+  canvas.style.height = cssH + "px";
+  canvas.width = Math.floor(WIDTH * dpr);
+  canvas.height = Math.floor(HEIGHT * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resizeCanvas);
+window.addEventListener("orientationchange", () => setTimeout(resizeCanvas, 60));
+
+function clientToLogical(clientX, clientY){
+  const rect = canvas.getBoundingClientRect();
+  let lx = rect.width > 0 ? (clientX - rect.left) / rect.width * WIDTH : WIDTH/2;
+  let ly = rect.height > 0 ? (clientY - rect.top) / rect.height * HEIGHT : HEIGHT/2;
+  lx = Math.max(0, Math.min(WIDTH, lx));
+  ly = Math.max(0, Math.min(HEIGHT, ly));
+  return { x: lx, y: ly };
+}
+
+// --------------------------------------------------------------------------
+// GLOW / DRAW HELPERS - note the bright white "core" details baked into
+// both drawGlowRect (thin inset highlight strip) and drawGlowCircle (inset
+// white disc), which are specific to this game's visual style and different
+// from a plain colored glow.
+// --------------------------------------------------------------------------
+function roundRectPath(x, y, w, h, r){
+  r = Math.max(0, Math.min(r, Math.abs(w)/2, Math.abs(h)/2));
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.lineTo(x+w-r, y);
+  ctx.arcTo(x+w, y, x+w, y+r, r);
+  ctx.lineTo(x+w, y+h-r);
+  ctx.arcTo(x+w, y+h, x+w-r, y+h, r);
+  ctx.lineTo(x+r, y+h);
+  ctx.arcTo(x, y+h, x, y+h-r, r);
+  ctx.lineTo(x, y+r);
+  ctx.arcTo(x, y, x+r, y, r);
+  ctx.closePath();
+}
+
+function drawAACircle(x, y, r, color, alpha = 1){
+  ctx.fillStyle = rgb(color, alpha);
+  ctx.beginPath();
+  ctx.arc(x, y, Math.max(0.5, r), 0, Math.PI*2);
+  ctx.fill();
+}
+
+function drawGlowRect(x, y, w, h, color, opts = {}){
+  const layers = opts.layers ?? 5, expand = opts.expand ?? 3, baseAlpha = opts.baseAlpha ?? 55, radius = opts.radius ?? 5;
+  for (let i = layers; i >= 1; i--){
+    const a = (baseAlpha * (i/layers)) / 255;
+    const gw = w + i*expand*2, gh = h + i*expand*2;
+    ctx.fillStyle = rgb(color, a);
+    roundRectPath(x - i*expand, y - i*expand, gw, gh, radius+i);
+    ctx.fill();
+  }
+  ctx.fillStyle = rgb(color, 1);
+  roundRectPath(x, y, w, h, radius);
+  ctx.fill();
+  const innerW = w*0.5, innerH = h*0.5;
+  if (innerW > 2 && innerH > 2){
+    ctx.fillStyle = rgb(WHITE, 1);
+    roundRectPath(x + (w-innerW)/2, y + (h-innerH)/2, innerW, innerH, 2);
+    ctx.fill();
+  }
+}
+
+function drawGlowCircle(x, y, radius, color, opts = {}){
+  const layers = opts.layers ?? 4, expand = opts.expand ?? 3, baseAlpha = opts.baseAlpha ?? 70;
+  for (let i = layers; i >= 1; i--){
+    const a = (baseAlpha * (i/layers)) / 255;
+    drawAACircle(x, y, radius + i*expand, color, a);
+  }
+  drawAACircle(x, y, radius, color, 1);
+  drawAACircle(x, y, Math.max(1, radius - 3), WHITE, 1);
+}
+
+function drawTextCenter(text, font, color, cx, cy, glowColor = null){
+  ctx.font = font;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  if (glowColor){
+    ctx.fillStyle = rgb(glowColor, 1);
+    for (const [dx,dy] of [[-2,0],[2,0],[0,-2],[0,2]]) ctx.fillText(text, cx+dx, cy+dy);
+  }
+  ctx.fillStyle = rgb(color, 1);
+  ctx.fillText(text, cx, cy);
+}
+
+function heartbeatPulse(t){
+  const cycle = t % 1.0;
+  const bump = (center, width) => Math.max(0, 1 - Math.abs(cycle-center)/width);
+  return Math.min(1, Math.max(bump(0.05,0.09), bump(0.28,0.09)*0.7));
+}
+function heartbeatColor(t, dim=[90,20,25], bright=[255,90,100]){
+  const k = heartbeatPulse(t);
+  return [0,1,2].map(i => Math.round(dim[i] + (bright[i]-dim[i])*k));
+}
+
+// --------------------------------------------------------------------------
+// BACKGROUND - static neon grid + static stars (no per-frame animation in
+// the original, unlike Void Breaker's parallax starfield). Because of that,
+// drawBackground is a pure, self-contained draw call with no matching
+// "update" - it's always safe to call unconditionally at the very start of
+// draw(), every frame, for every state. This sidesteps an entire class of
+// bug from Void Breaker (background painted during update() then wiped
+// before draw() ran, so it silently vanished on every screen except the
+// two that happened to redundantly repaint it).
+// --------------------------------------------------------------------------
+let STARS = [];
+function initStars(){
+  STARS = [];
+  for (let i = 0; i < 90; i++) STARS.push([Math.random()*WIDTH, Math.random()*HEIGHT, randRange([0.3,1.2])]);
+}
+
+function drawBackground(){
+  ctx.fillStyle = rgb(BG_COLOR, 1);
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+  ctx.strokeStyle = rgb(GRID_LINE, 1);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let yy = 0; yy < HEIGHT; yy += 40){ ctx.moveTo(0, yy+0.5); ctx.lineTo(WIDTH, yy+0.5); }
+  for (let xx = 0; xx < WIDTH; xx += 40){ ctx.moveTo(xx+0.5, 0); ctx.lineTo(xx+0.5, HEIGHT); }
+  ctx.stroke();
+  for (const [sx, sy, b] of STARS){
+    const c = Math.round(90 + 90*b);
+    ctx.fillStyle = `rgb(${c},${c},${Math.min(255,c+20)})`;
+    ctx.fillRect(sx, sy, 1, 1);
+  }
+}
+
+// --------------------------------------------------------------------------
+// UI BUTTON - flat rounded rect + border stroke, NOT a glow effect. This is
+// a deliberately different visual language from Void Breaker's glow-button.
+// --------------------------------------------------------------------------
+class Button {
+  constructor(x, y, w, h, label, enabled = true){
+    this.x=x; this.y=y; this.w=w; this.h=h; this.label=label; this.enabled=enabled;
+  }
+  get cx(){ return this.x+this.w/2; } get cy(){ return this.y+this.h/2; }
+  hit(px, py){ return this.enabled && px>=this.x && px<=this.x+this.w && py>=this.y && py<=this.y+this.h; }
+  draw(hover = false){
+    let base, border, textColor;
+    if (!this.enabled){ base=[22,22,30]; border=[70,70,85]; textColor=GRAY; }
+    else if (hover){ base=[55,55,90]; border=CYAN; textColor=WHITE; }
+    else { base=[32,32,52]; border=[90,90,130]; textColor=WHITE; }
+    ctx.fillStyle = rgb(base,1);
+    roundRectPath(this.x, this.y, this.w, this.h, 8); ctx.fill();
+    ctx.strokeStyle = rgb(border,1); ctx.lineWidth = 2;
+    roundRectPath(this.x+1, this.y+1, this.w-2, this.h-2, 8); ctx.stroke();
+    drawTextCenter(this.label, FONT_SMALL, textColor, this.cx, this.cy);
+  }
+}
+
+// --------------------------------------------------------------------------
+// PARTICLES - straight-line motion with a slight downward gravity curve, no
+// velocity damping (different from Void Breaker's drag-based particles).
+// --------------------------------------------------------------------------
+class Particle {
+  constructor(x, y, color){
+    this.x=x; this.y=y;
+    const angle = Math.random()*Math.PI*2;
+    const speed = randRange([1.5,5.5]) * 60; // per-tick -> per-second
+    this.vx = Math.cos(angle)*speed;
+    this.vy = Math.sin(angle)*speed;
+    this.life = this.maxLife = randRange([0.25,0.55]);
+    this.color = color;
+    this.size = randRange([2,4]);
+  }
+  update(dt){
+    this.x += this.vx*dt; this.y += this.vy*dt;
+    this.vy += 6*60*dt; // slight gravity, matches original's per-tick-implied accel
+    this.life -= dt;
+    return this.life > 0;
+  }
+  draw(){
+    const alpha = Math.max(0, this.life/this.maxLife);
+    drawAACircle(this.x, this.y, this.size, this.color, alpha);
+  }
+}
+
+// --------------------------------------------------------------------------
+// PADDLE
+// --------------------------------------------------------------------------
+let PADDLE_Y = HEIGHT - 50;
+const PADDLE_H = 16;
+const PADDLE_W_NORMAL = 110;
+const PADDLE_W_WIDE = 165;
+const PADDLE_W_SHRUNK = 70;
+const PADDLE_SPEED = 11 * 60; // per-tick -> per-second
+const PADDLE_CORNER_ZONE = 10;
+const MAX_LIVES = 6;
+
+class Paddle {
+  constructor(){
+    this.width = PADDLE_W_NORMAL;
+    this.height = PADDLE_H;
+    this.x = WIDTH/2 - this.width/2;
+    this.y = PADDLE_Y;
+    this.wideTimer = 0.0;
+    this.shrinkTimer = 0.0;
+    this.speed = PADDLE_SPEED;
+  }
+  get rectX(){ return this.x; }
+  hit(px, py){ return px>=this.x && px<=this.x+this.width && py>=this.y && py<=this.y+this.height; }
+  intersects(rx, ry, rw, rh){ return this.x < rx+rw && this.x+this.width > rx && this.y < ry+rh && this.y+this.height > ry; }
+  applyWidth(dt){
+    let target;
+    if (this.wideTimer > 0) target = PADDLE_W_WIDE;
+    else if (this.shrinkTimer > 0) target = PADDLE_W_SHRUNK;
+    else target = PADDLE_W_NORMAL;
+    if (this.width !== target){
+      const center = this.x + this.width/2;
+      this.width += (target - this.width) * approachFactor(0.25, dt);
+      if (Math.abs(this.width - target) < 1) this.width = target;
+      this.x = center - this.width/2;
+    }
+  }
+  update(dt, keys, mouseDx, mouseControl){
+    if (this.wideTimer > 0) this.wideTimer -= dt;
+    if (this.shrinkTimer > 0) this.shrinkTimer -= dt;
+    this.applyWidth(dt);
+
+    let moved = false;
+    if (keys["ArrowLeft"] || keys["KeyA"]){ this.x -= this.speed*dt; moved = true; }
+    if (keys["ArrowRight"] || keys["KeyD"]){ this.x += this.speed*dt; moved = true; }
+    if (mouseControl && !moved) this.x = mouseDx - this.width/2;
+    this.x = Math.max(10, Math.min(WIDTH - 10 - this.width, this.x));
+  }
+  grantWide(){ this.wideTimer = 9.0; this.shrinkTimer = 0.0; }
+  grantShrink(){ this.shrinkTimer = 7.0; this.wideTimer = 0.0; }
+  draw(){
+    const color = this.wideTimer > 0 ? GREEN : (this.shrinkTimer > 0 ? RED : CYAN);
+    drawGlowRect(this.x, this.y, this.width, this.height, color, { radius: 8 });
+  }
+}
+
+// --------------------------------------------------------------------------
+// BALL
+// --------------------------------------------------------------------------
+const BALL_RADIUS = 8;
+const BASE_BALL_SPEED = 6.5 * 60; // per-tick -> per-second
+
+class Ball {
+  constructor(x, y, speed, angle = null, stuck = false){
+    this.x=x; this.y=y;
+    this.radius = BALL_RADIUS;
+    this.baseSpeed = speed;
+    if (angle === null) angle = randRange([-0.6,0.6]) - Math.PI/2;
+    this.dx = Math.cos(angle); this.dy = Math.sin(angle);
+    this.stuck = stuck;
+    this.slowTimer = 0.0;
+    this.fastTimer = 0.0;
+    this.trail = [];
+  }
+  get speed(){
+    let mult = 1.0;
+    if (this.slowTimer > 0) mult *= 0.6;
+    if (this.fastTimer > 0) mult *= 1.55;
+    return this.baseSpeed * mult;
+  }
+  launchFrom(paddle){
+    this.stuck = false;
+    const offset = (this.x - (paddle.x + paddle.width/2)) / (paddle.width/2);
+    const angle = -Math.PI/2 + offset*0.9;
+    this.dx = Math.cos(angle); this.dy = Math.sin(angle);
+  }
+  updateTimersAndTrail(dt, paddle){
+    if (this.slowTimer > 0) this.slowTimer -= dt;
+    if (this.fastTimer > 0) this.fastTimer -= dt;
+    if (this.stuck){
+      this.x = paddle.x + paddle.width/2;
+      this.y = paddle.y - this.radius - 2;
+      return;
+    }
+    this.trail.push([this.x, this.y]);
+    if (this.trail.length > 8) this.trail.shift();
+  }
+  move(dist){
+    this.x += this.dx*dist; this.y += this.dy*dist;
+    let bounced = false;
+    if (this.x - this.radius <= 0){ this.x = this.radius; this.dx = Math.abs(this.dx); bounced = true; }
+    else if (this.x + this.radius >= WIDTH){ this.x = WIDTH - this.radius; this.dx = -Math.abs(this.dx); bounced = true; }
+    if (this.y - this.radius <= 0){ this.y = this.radius; this.dy = Math.abs(this.dy); bounced = true; }
+    return bounced;
+  }
+  rectBox(){ return { x: this.x-this.radius, y: this.y-this.radius, w: this.radius*2, h: this.radius*2 }; }
+  draw(){
+    for (let i = 0; i < this.trail.length; i++){
+      const [tx,ty] = this.trail[i];
+      const a = (90*(i/Math.max(1,this.trail.length)))/255;
+      drawAACircle(tx, ty, this.radius-2, YELLOW, a);
+    }
+    const color = this.slowTimer>0 ? BLUE : (this.fastTimer>0 ? ORANGE : YELLOW);
+    drawGlowCircle(this.x, this.y, this.radius, color);
+  }
+}
+
+// --------------------------------------------------------------------------
+// BRICK
+// --------------------------------------------------------------------------
+class Brick {
+  constructor(x, y, w, h, hp, unbreakable = false){
+    this.x=x; this.y=y; this.w=w; this.h=h;
+    this.hp = hp; this.maxHp = hp;
+    this.unbreakable = unbreakable;
+    this.alive = true;
+    this.hitFlash = 0.0;
+  }
+  hit(){
+    if (this.unbreakable){ this.hitFlash = 0.15; return false; }
+    this.hp -= 1;
+    this.hitFlash = 0.15;
+    if (this.hp <= 0){ this.alive = false; return true; }
+    return false;
+  }
+  color(){
+    if (this.unbreakable) return [90,95,110];
+    return HP_COLORS[Math.min(this.hp,4)] || RED;
+  }
+  update(dt){ if (this.hitFlash > 0) this.hitFlash -= dt; }
+  draw(){
+    let col = this.color();
+    if (this.hitFlash > 0) col = col.map(c => Math.min(255, c+90));
+    drawGlowRect(this.x, this.y, this.w, this.h, col, { layers:3, expand:2, baseAlpha:40, radius:3 });
+    if (this.unbreakable){
+      ctx.strokeStyle = rgb([150,150,165],1); ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(this.x, this.y); ctx.lineTo(this.x+this.w, this.y+this.h);
+      ctx.moveTo(this.x, this.y+this.h); ctx.lineTo(this.x+this.w, this.y);
+      ctx.stroke();
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// POWERUP
+// --------------------------------------------------------------------------
+const POWERUP_SIZE = 28;
+const LASER_WIDTH_DESIGN = 90;
+
+class PowerUp {
+  static LIFESPAN = 9.0;
+  constructor(x, y, kind){
+    this.x=x; this.y=y; this.kind=kind;
+    const info = POWERUP_INFO[kind];
+    this.letter = info.letter; this.color = info.color;
+    this.vy = 2.6*60; // per-tick -> per-second
+    this.lifespan = PowerUp.LIFESPAN;
+  }
+  update(dt){ this.y += this.vy*dt; this.lifespan -= dt; }
+  get expired(){ return this.lifespan <= 0; }
+  rectBox(){ const half = POWERUP_SIZE/2; return { x:this.x-half, y:this.y-half, w:POWERUP_SIZE, h:POWERUP_SIZE }; }
+  draw(){
+    if (this.lifespan < 1.5 && Math.floor(this.lifespan*8)%2===0) return;
+    const r = this.rectBox();
+    drawGlowRect(r.x, r.y, r.w, r.h, this.color, { layers:4, expand:2, baseAlpha:70, radius:14 });
+    drawTextCenter(this.letter, FONT_SMALL, [10,10,15], this.x, this.y);
+  }
+}
+
+// --------------------------------------------------------------------------
+// LASER - telegraphed hazard: warning band, then a full-height beam. Costs
+// a life if the paddle is still in its path when it fires.
+// --------------------------------------------------------------------------
+class Laser {
+  static WARNING_DURATION = 3.0;
+  static FIRE_DURATION = 0.45;
+  constructor(x, width){
+    this.x=x; this.width=width; this.timer=0.0; this.state="warning"; this.hitApplied=false;
+  }
+  update(dt){
+    this.timer += dt;
+    if (this.state==="warning" && this.timer >= Laser.WARNING_DURATION){ this.state="firing"; this.timer=0.0; }
+    else if (this.state==="firing" && this.timer >= Laser.FIRE_DURATION){ this.state="done"; }
+  }
+  rectBox(){ return { x:this.x-this.width/2, y:0, w:this.width, h:HEIGHT }; }
+  intersectsPaddle(paddle){
+    const r = this.rectBox();
+    return paddle.x < r.x+r.w && paddle.x+paddle.width > r.x && paddle.y < r.y+r.h && paddle.y+paddle.height > r.y;
+  }
+  draw(){
+    const half = this.width/2;
+    if (this.state==="warning"){
+      const pulse = 0.35 + 0.65*Math.abs(Math.sin(this.timer*6));
+      const bandH = 150;
+      const alpha = (120*pulse)/255;
+      ctx.fillStyle = rgb([255,60,60], alpha);
+      ctx.fillRect(this.x-half, HEIGHT-bandH, this.width, bandH);
+      ctx.strokeStyle = rgb([255,160,60], Math.min(255,120*pulse+60)/255);
+      ctx.lineWidth = 3;
+      ctx.strokeRect(this.x-half+1.5, HEIGHT-bandH+1.5, this.width-3, bandH-3);
+      if (pulse > 0.7) drawTextCenter("!", FONT_MED, [255,220,60], this.x, HEIGHT-bandH+24);
+    } else if (this.state==="firing"){
+      const fade = 1.0 - (this.timer/Laser.FIRE_DURATION);
+      ctx.fillStyle = rgb([255,230,200], (90*fade)/255);
+      ctx.fillRect(this.x-half, 0, this.width, HEIGHT);
+      const coreW = Math.max(2, this.width*0.35);
+      ctx.fillStyle = rgb(WHITE, (220*fade)/255);
+      ctx.fillRect(this.x-coreW/2, 0, coreW, HEIGHT);
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// STAGE / LEVEL DESIGN
+// --------------------------------------------------------------------------
+const BRICK_TOP = 70, BRICK_GAP = 6, BRICK_H = 24, COLS = 14, MARGIN_X = 40;
+
+function stageConfig(stage){
+  return {
+    rows: Math.min(4 + Math.floor((stage-1)/2), 9),
+    hpMax: Math.min(1 + Math.floor((stage-1)/3), 4),
+    unbreakChance: stage >= 3 ? Math.max(0.0, (stage-3)*0.025) : 0.0,
+    ballSpeed: BASE_BALL_SPEED + (stage-1)*0.72*60,
+    timeLimit: Math.max(40, Math.round(95 - 1.67*Math.pow(stage-1, 1.3))),
+    pattern: ["full","checker","pyramid","diamond","curtain","checker","pyramid","diamond","curtain","fortress"][(stage-1)%10],
+  };
+}
+
+function patternAlive(pattern, row, col, rows, cols){
+  const mid = (cols-1)/2;
+  if (pattern === "full") return true;
+  if (pattern === "checker") return (row+col)%2===0;
+  if (pattern === "pyramid"){ const span = Math.floor((row+1)*(cols/(2*rows))); return Math.abs(col-mid) <= span; }
+  if (pattern === "diamond"){ const half=rows/2; const distR=Math.abs(row-half); const span=(rows/2-distR)*(cols/rows); return Math.abs(col-mid) <= span; }
+  if (pattern === "curtain") return !(row%3===1 && col%4===2);
+  if (pattern === "fortress"){ const border = row===0||row===rows-1||col===0||col===cols-1; return border || (row+col)%2===0; }
+  return true;
+}
+
+function buildBricks(stage){
+  const cfg = stageConfig(stage);
+  const rows = cfg.rows, cols = COLS;
+  const usableW = WIDTH - MARGIN_X*2;
+  const brickW = (usableW - BRICK_GAP*(cols-1)) / cols;
+  const bricks = [];
+  const rng = makeSeededRng(stage*7919 + 13);
+  for (let row = 0; row < rows; row++){
+    for (let col = 0; col < cols; col++){
+      if (!patternAlive(cfg.pattern, row, col, rows, cols)) continue;
+      const x = MARGIN_X + col*(brickW+BRICK_GAP);
+      const y = BRICK_TOP + row*(BRICK_H+BRICK_GAP);
+      const hp = rngInt(rng, 1, cfg.hpMax);
+      const unbreakable = rng() < cfg.unbreakChance && row !== rows-1;
+      bricks.push(new Brick(x, y, brickW, BRICK_H, hp, unbreakable));
+    }
+  }
+  return { bricks, cfg };
+}
+
+const ENDLESS_PATTERNS = ["full","checker","pyramid","diamond","curtain","fortress"];
+function endlessStageConfig(stage, lastPattern){
+  const choices = ENDLESS_PATTERNS.filter(p => p !== lastPattern);
+  const pool = choices.length ? choices : ENDLESS_PATTERNS;
+  return {
+    rows: Math.min(4 + Math.floor((stage-1)/2), 9),
+    hpMax: Math.min(1 + Math.floor((stage-1)/3), 4),
+    unbreakChance: Math.min(0.35, Math.max(0.0, (stage-3)*0.025)),
+    ballSpeed: BASE_BALL_SPEED + (stage-1)*0.72*60,
+    timeLimit: 120,
+    pattern: choice(pool),
+  };
+}
+
+function buildEndlessBricks(stage, lastPattern){
+  const cfg = endlessStageConfig(stage, lastPattern);
+  const rows = cfg.rows, cols = COLS;
+  const usableW = WIDTH - MARGIN_X*2;
+  const brickW = (usableW - BRICK_GAP*(cols-1)) / cols;
+  const bricks = [];
+  for (let row = 0; row < rows; row++){
+    for (let col = 0; col < cols; col++){
+      if (!patternAlive(cfg.pattern, row, col, rows, cols)) continue;
+      const x = MARGIN_X + col*(brickW+BRICK_GAP);
+      const y = BRICK_TOP + row*(BRICK_H+BRICK_GAP);
+      const hp = 1 + Math.floor(Math.random()*cfg.hpMax);
+      const unbreakable = Math.random() < cfg.unbreakChance && row !== rows-1;
+      bricks.push(new Brick(x, y, brickW, BRICK_H, hp, unbreakable));
+    }
+  }
+  return { bricks, cfg };
+}
+
+const STATE_MENU="menu", STATE_HIGHSCORES="highscores", STATE_STAGE_SELECT="stage_select",
+      STATE_READY="ready", STATE_PLAY="play", STATE_STAGE_CLEAR="stage_clear",
+      STATE_PAUSED="paused", STATE_GAME_OVER="game_over", STATE_VICTORY="victory";
+
+function rectContains(r, px, py){ return px>=r.x && px<=r.x+r.w && py>=r.y && py<=r.y+r.h; }
+function rectsIntersect(a, b){ return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y; }
+const PAUSE_BUTTON_RECT = { x: 14, y: 8, w: 30, h: 30 };
+const IS_TOUCH = ("ontouchstart" in window) || (navigator.maxTouchPoints > 0);
+
+// --------------------------------------------------------------------------
+// MAIN GAME CLASS
+// --------------------------------------------------------------------------
+function makeRunId(){ return Math.random().toString(36).slice(2) + Date.now().toString(36); }
+
+class Game {
+  constructor(){
+    this.state = STATE_MENU;
+    this.prePauseState = STATE_READY;
+    this.highscores = loadHighscores();
+    this.isNewBest = false;
+    this.highscoreRank = null;
+    this.mouseLogical = { x:0, y:0 };
+    this._scoreFinalized = false;
+    this._runId = null;
+    this._lastAutosavedScore = 0;
+    this._autosaveAccum = 0.0;
+    this.endless = false;
+    this._lastEndlessPattern = null;
+    this.resumeCooldown = 0.0;
+    this.score = 0;
+    this.stage = 1;
+    this.cursorOverrideVisible = false;
+    this.resetFull();
+    this.state = STATE_MENU; // start on the menu, not straight into READY
+  }
+
+  _beginNewRun(){
+    this.finalizeScore();
+    this._scoreFinalized = false;
+    this._runId = makeRunId();
+    this._lastAutosavedScore = 0;
+    this._autosaveAccum = 0.0;
+  }
+
+  resetFull(){
+    this._beginNewRun();
+    this.stage = 1; this.endless = false; this.score = 0;
+    this.lives = 4; // 3 hearts shown at start (hearts displayed = lives-1)
+    this.paddle = new Paddle();
+    this.balls = []; this.bricks = []; this.powerups = []; this.particles = []; this.lasers = [];
+    this.readyTimer = 0.0; this.stageClearBonus = 0;
+    this.mouseControlActive = false;
+    this.isNewBest = false; this.highscoreRank = null;
+    this.loadStage(this.stage);
+  }
+
+  startAtStage(stage){
+    this._beginNewRun();
+    this.stage = stage; this.score = 0;
+    this.lives = 4;
+    this.particles = []; this.powerups = []; this.lasers = [];
+    this.isNewBest = false; this.highscoreRank = null;
+    this.loadStage(stage);
+  }
+
+  continueGame(){
+    const target = CONFIG.max_stage_reached || 1;
+    this.startAtStage(target);
+  }
+
+  startEndless(){
+    this._beginNewRun();
+    this.endless = true;
+    this._lastEndlessPattern = null;
+    this.stage = TOTAL_STAGES + 1;
+    this.score = 0; this.lives = 4;
+    this.particles = []; this.powerups = []; this.lasers = [];
+    this.isNewBest = false; this.highscoreRank = null;
+    this.loadStage(this.stage);
+  }
+
+  loadStage(stage){
+    applyDynamicResolution();
+    this.cursorOverrideVisible = false;
+    this.resumeCooldown = 0.0;
+    let result;
+    if (this.endless){
+      result = buildEndlessBricks(stage, this._lastEndlessPattern);
+      this._lastEndlessPattern = result.cfg.pattern;
+    } else {
+      result = buildBricks(stage);
+    }
+    this.bricks = result.bricks; this.cfg = result.cfg;
+    this.paddle = new Paddle();
+    this.powerups = []; this.particles = [];
+    this.stageSpeedMult = 1.0;
+    const speed = this.cfg.ballSpeed;
+    const b = new Ball(this.paddle.x + this.paddle.width/2, this.paddle.y - BALL_RADIUS - 2, speed, null, true);
+    this.balls = [b];
+    this.readyTimer = 1.2;
+    this.stageTimeLeft = this.cfg.timeLimit;
+    this.timeExpired = false;
+    this.shakeTimeLeft = 0.0; this.shakeDurationTotal = 0.0; this.shakeMagnitude = 0.0;
+    this._fireSpawnAccum = 0.0;
+    this.powerupSpawnTimer = randRange([5.0,8.0]);
+    this.lasers = [];
+    this.laserSpawnTimer = randRange([4.0,7.0]);
+    this.paddleStillTimer = 0.0;
+    this._lastPaddleX = null;
+    this.state = STATE_READY;
+    this.prePauseState = STATE_READY;
+  }
+
+  // ---------------- spawning / effects ----------------
+  spawnParticles(x, y, color, n = 14){ for (let i=0;i<n;i++) this.particles.push(new Particle(x,y,color)); }
+
+  spawnRandomPowerup(){
+    let pool;
+    if (this.timeExpired) pool = POWERUP_KEYS.filter(k => k!=="slow" && k!=="shrink");
+    else pool = POWERUP_KEYS.slice();
+    if (this.lives >= MAX_LIVES) pool = pool.filter(k => k!=="life");
+    if (pool.length === 0) return;
+    const weights = pool.map(k => POWERUP_INFO[k].weight);
+    const kind = weightedChoice(pool, weights);
+    const x = randRange([60, WIDTH-60]);
+    const y = randRange([90, 160]);
+    this.powerups.push(new PowerUp(x, y, kind));
+  }
+
+  spawnLaser(targetX){
+    if (this.lasers.length >= 3) return;
+    const width = LASER_WIDTH_DESIGN;
+    const x = Math.max(width/2+10, Math.min(WIDTH-width/2-10, targetX));
+    this.lasers.push(new Laser(x, width));
+    playSound("laser_charge");
+  }
+
+  triggerShake(duration, magnitude){
+    this.shakeTimeLeft = duration; this.shakeDurationTotal = duration; this.shakeMagnitude = magnitude;
+  }
+
+  triggerTimeoutEffect(){
+    this.triggerShake(0.6, 16);
+    for (const b of this.balls) b.baseSpeed *= 1.08;
+    this.stageSpeedMult *= 1.08;
+    for (let i=0;i<4;i++){
+      const fx = randRange([60,WIDTH-60]), fy = randRange([100,HEIGHT-150]);
+      this.spawnParticles(fx, fy, choice([RED,ORANGE,YELLOW]), 10);
+    }
+    playSound("timeout");
+  }
+
+  applyPowerup(kind){
+    if (kind === "widen") this.paddle.grantWide();
+    else if (kind === "shrink") this.paddle.grantShrink();
+    else if (kind === "multiball"){
+      const originX = this.paddle.x + this.paddle.width/2;
+      const originY = this.paddle.y - BALL_RADIUS - 2;
+      const speed = this.balls.length ? this.balls[0].baseSpeed : this.cfg.ballSpeed*this.stageSpeedMult;
+      const spreadAngles = [-Math.PI/2-0.55, -Math.PI/2, -Math.PI/2+0.55];
+      for (const angle of spreadAngles) this.balls.push(new Ball(originX, originY, speed, angle, false));
+      for (const b of this.balls) if (b.stuck) b.launchFrom(this.paddle);
+      this.spawnParticles(originX, originY, MAGENTA, 16);
+    } else if (kind === "slow"){
+      for (const b of this.balls){ b.slowTimer = 6.0; b.fastTimer = 0.0; }
+    } else if (kind === "fast"){
+      for (const b of this.balls){ b.fastTimer = 5.0; b.slowTimer = 0.0; }
+    } else if (kind === "life"){
+      this.lives = Math.min(this.lives+1, MAX_LIVES);
+    }
+  }
+
+  // ---------------- collisions ----------------
+  resolveBallBrick(ball, brick){
+    const br = ball.rectBox();
+    const rect = { x:brick.x, y:brick.y, w:brick.w, h:brick.h };
+    const overlapL = (br.x+br.w) - rect.x;
+    const overlapR = (rect.x+rect.w) - br.x;
+    const overlapT = (br.y+br.h) - rect.y;
+    const overlapB = (rect.y+rect.h) - br.y;
+    const minOverlap = Math.min(overlapL, overlapR, overlapT, overlapB);
+
+    if (minOverlap === overlapL || minOverlap === overlapR){
+      ball.dx = -ball.dx;
+      if (minOverlap === overlapL) ball.x = rect.x - ball.radius - 0.5;
+      else ball.x = rect.x+rect.w + ball.radius + 0.5;
+    } else {
+      ball.dy = -ball.dy;
+      if (minOverlap === overlapT) ball.y = rect.y - ball.radius - 0.5;
+      else ball.y = rect.y+rect.h + ball.radius + 0.5;
+    }
+
+    const broke = brick.hit();
+    const color = brick.color();
+    this.spawnParticles(rect.x+rect.w/2, rect.y+rect.h/2, color, broke ? 10 : 5);
+
+    if (broke){
+      this.score += Math.round(10 * brick.maxHp * this.stageScoreMult());
+      playSound("brick_break");
+    } else {
+      this.score += 2;
+      playSound("brick_hit");
+    }
+  }
+
+  stageScoreMult(){ return 1 + (this.stage-1)*0.15; }
+
+  finalizeScore(){
+    if (this._scoreFinalized || this.score <= 0) return;
+    this._scoreFinalized = true;
+    const priorBest = this.highscores.length ? this.highscores[0].score : 0;
+    this.isNewBest = this.score > priorBest;
+    this.highscores = saveHighscore(this.score, this.stage, this.endless, this._runId);
+    this.highscoreRank = null;
+    for (let i=0;i<this.highscores.length;i++){
+      if (this.highscores[i].score === this.score && this.highscores[i].stage === this.stage){ this.highscoreRank = i; break; }
+    }
+  }
+
+  _autosaveTick(dt){
+    if (this._scoreFinalized || this.score <= 0 || this.score === this._lastAutosavedScore) return;
+    this._autosaveAccum += dt;
+    if (this._autosaveAccum < 3.0) return;
+    this._autosaveAccum = 0.0;
+    this._lastAutosavedScore = this.score;
+    this.highscores = saveHighscore(this.score, this.stage, this.endless, this._runId);
+  }
+
+  // ---------------- pause ----------------
+  togglePause(){
+    if (this.state === STATE_PLAY || this.state === STATE_READY){
+      this.prePauseState = this.state;
+      this.state = STATE_PAUSED;
+      playSound("ui_click");
+    } else if (this.state === STATE_PAUSED){
+      this.state = this.prePauseState;
+      this.resumeCooldown = 3.0;
+      playSound("countdown_tick");
+    }
+  }
+
+  restartStage(){ this.loadStage(this.stage); }
+
+  // ---------------- update ----------------
+  update(dt, keys, mousePos, mouseMoved){
+    this._autosaveTick(dt);
+    this.mouseLogical = mousePos;
+    if (mouseMoved) this.mouseControlActive = true;
+    if (keys["ArrowLeft"] || keys["ArrowRight"] || keys["KeyA"] || keys["KeyD"]) this.mouseControlActive = false;
+
+    for (let i = this.particles.length-1; i>=0; i--) if (!this.particles[i].update(dt)) this.particles.splice(i,1);
+
+    if (this.shakeTimeLeft > 0) this.shakeTimeLeft = Math.max(0, this.shakeTimeLeft - dt);
+
+    if (this.resumeCooldown > 0 && (this.state===STATE_PLAY || this.state===STATE_READY)){
+      const prevCeil = Math.ceil(this.resumeCooldown);
+      this.resumeCooldown = Math.max(0, this.resumeCooldown - dt);
+      const newCeil = Math.ceil(this.resumeCooldown);
+      if (this.resumeCooldown <= 0) playSound("countdown_go");
+      else if (newCeil !== prevCeil) playSound("countdown_tick");
+      return;
+    }
+
+    if (this.state === STATE_READY){
+      this.paddle.update(dt, keys, mousePos.x, this.mouseControlActive);
+      for (const b of this.balls) b.updateTimersAndTrail(dt, this.paddle);
+      this.readyTimer -= dt;
+      if (this.readyTimer <= 0) this.state = STATE_PLAY;
+      return;
+    }
+
+    if (this.state !== STATE_PLAY) return;
+
+    this.paddle.update(dt, keys, mousePos.x, this.mouseControlActive);
+
+    // AFK detection: camping in one spot to cheese an easy brick column
+    if (this._lastPaddleX !== null && Math.abs(this.paddle.x - this._lastPaddleX) < 0.5) this.paddleStillTimer += dt;
+    else this.paddleStillTimer = 0.0;
+    this._lastPaddleX = this.paddle.x;
+    if (this.paddleStillTimer >= 6.0){
+      this.spawnLaser(this.paddle.x + this.paddle.width/2);
+      this.paddleStillTimer = 0.0;
+    }
+
+    // stage timer / difficulty spike
+    if (!this.timeExpired){
+      this.stageTimeLeft -= dt;
+      if (this.stageTimeLeft <= 0){
+        this.stageTimeLeft = 0; this.timeExpired = true;
+        this.triggerTimeoutEffect();
+      }
+    }
+
+    if (this.timeExpired){
+      this._fireSpawnAccum += dt;
+      if (this._fireSpawnAccum >= 0.45){
+        this._fireSpawnAccum = 0.0;
+        const fx = randRange([40,WIDTH-40]), fy = randRange([90,HEIGHT-140]);
+        this.spawnParticles(fx, fy, choice([RED,ORANGE,YELLOW]), 5);
+      }
+      this.laserSpawnTimer -= dt;
+      if (this.laserSpawnTimer <= 0){
+        const width = LASER_WIDTH_DESIGN;
+        const x = randRange([width/2+20, WIDTH-width/2-20]);
+        this.spawnLaser(x);
+        this.laserSpawnTimer = randRange([4.0,7.0]);
+      }
+    }
+
+    // laser update / collision
+    for (let i = this.lasers.length-1; i>=0; i--){
+      const laser = this.lasers[i];
+      const wasWarning = laser.state === "warning";
+      laser.update(dt);
+      if (wasWarning && laser.state === "firing"){
+        playSound("laser_fire");
+        this.triggerShake(0.15, 6);
+      }
+      if (laser.state === "firing" && !laser.hitApplied){
+        if (laser.intersectsPaddle(this.paddle)){
+          laser.hitApplied = true;
+          this.lives -= 1;
+          playSound("laser_hit");
+          this.spawnParticles(this.paddle.x+this.paddle.width/2, this.paddle.y, RED, 20);
+          this.triggerShake(0.35, 12);
+          if (this.lives <= 0){
+            this.state = STATE_GAME_OVER;
+            playSound("game_over");
+            this.finalizeScore();
+            return;
+          }
+        }
+      }
+      if (laser.state === "done") this.lasers.splice(i,1);
+    }
+
+    // random powerup spawning
+    this.powerupSpawnTimer -= dt;
+    if (this.powerupSpawnTimer <= 0){
+      this.spawnRandomPowerup();
+      this.powerupSpawnTimer = randRange([6.0,11.0]);
+    }
+
+    for (let bi = this.balls.length-1; bi>=0; bi--){
+      const b = this.balls[bi];
+      b.updateTimersAndTrail(dt, this.paddle);
+      if (b.stuck) continue;
+
+      // Sub-step movement so a fast ball can never tunnel through a brick or paddle.
+      const totalDist = b.speed * dt;
+      const steps = Math.max(1, Math.floor(totalDist / Math.max(1,b.radius)) + 1);
+      const stepDist = totalDist / steps;
+
+      let ballRemoved = false;
+      for (let s = 0; s < steps; s++){
+        if (b.move(stepDist)) playSound("wall");
+
+        if (b.dy > 0 && rectsIntersect(b.rectBox(), {x:this.paddle.x,y:this.paddle.y,w:this.paddle.width,h:this.paddle.height}) && b.y < this.paddle.y+this.paddle.height){
+          b.y = this.paddle.y - b.radius - 1;
+          b.launchFrom(this.paddle);
+          const paddleLeft = this.paddle.x, paddleRight = this.paddle.x+this.paddle.width;
+          const isCornerHit = (b.x-paddleLeft <= PADDLE_CORNER_ZONE) || (paddleRight-b.x <= PADDLE_CORNER_ZONE);
+          if (isCornerHit){
+            b.fastTimer = Math.max(b.fastTimer, 1.2);
+            this.spawnParticles(b.x, b.y, YELLOW, 12);
+            playSound("corner_hit");
+          } else {
+            this.spawnParticles(b.x, b.y, CYAN, 6);
+            playSound("paddle");
+          }
+          break;
+        }
+
+        // brick collision: nearest colliding brick by center distance
+        let hitBrick = null, hitDistSq = null;
+        for (const brick of this.bricks){
+          if (brick.alive && rectsIntersect(b.rectBox(), {x:brick.x,y:brick.y,w:brick.w,h:brick.h})){
+            const dxc = b.x-(brick.x+brick.w/2), dyc = b.y-(brick.y+brick.h/2);
+            const d2 = dxc*dxc+dyc*dyc;
+            if (hitBrick===null || d2<hitDistSq){ hitBrick=brick; hitDistSq=d2; }
+          }
+        }
+        if (hitBrick){ this.resolveBallBrick(b, hitBrick); break; }
+
+        if (b.y - b.radius > HEIGHT){
+          this.balls.splice(bi,1);
+          ballRemoved = true;
+          break;
+        }
+      }
+      if (ballRemoved) continue;
+    }
+
+    for (const brick of this.bricks) brick.update(dt);
+    this.bricks = this.bricks.filter(br => br.alive || br.unbreakable);
+
+    for (let i = this.powerups.length-1; i>=0; i--){
+      const pu = this.powerups[i];
+      pu.update(dt);
+      const r = pu.rectBox();
+      if (rectsIntersect(r, {x:this.paddle.x,y:this.paddle.y,w:this.paddle.width,h:this.paddle.height})){
+        this.applyPowerup(pu.kind);
+        this.powerups.splice(i,1);
+        this.spawnParticles(pu.x, pu.y, pu.color, 12);
+        playSound(GOOD_POWERUPS.has(pu.kind) ? "powerup_good" : "powerup_bad");
+      } else if (pu.y > HEIGHT || pu.expired){
+        this.powerups.splice(i,1);
+      }
+    }
+
+    if (this.balls.length === 0){
+      this.lives -= 1;
+      playSound("life_lost");
+      if (this.lives <= 0){
+        this.state = STATE_GAME_OVER;
+        playSound("game_over");
+        this.finalizeScore();
+      } else {
+        this.paddle = new Paddle();
+        const speed = this.cfg.ballSpeed * this.stageSpeedMult;
+        const b = new Ball(this.paddle.x+this.paddle.width/2, this.paddle.y-BALL_RADIUS-2, speed, null, true);
+        this.balls = [b];
+        this.powerups = [];
+        this.readyTimer = 1.0;
+        this.state = STATE_READY;
+      }
+      return;
+    }
+
+    const allClearedOrUnbreakable = this.bricks.every(br => !br.alive || br.unbreakable);
+    const anyBreakableLeft = this.bricks.some(br => !br.unbreakable);
+    if (allClearedOrUnbreakable || !anyBreakableLeft){
+      this.stageClearBonus = 250*this.stage + this.lives*40;
+      this.score += this.stageClearBonus;
+      this.state = STATE_STAGE_CLEAR;
+      playSound("stage_clear");
+      if (!this.endless) updateProgress(CONFIG, this.stage);
+    }
+  }
+
+  nextStage(){
+    this.stage += 1;
+    if (this.endless){ this.loadStage(this.stage); return; }
+    if (this.stage > TOTAL_STAGES){
+      this.state = STATE_VICTORY;
+      playSound("victory");
+      this.finalizeScore();
+    } else {
+      this.loadStage(this.stage);
+    }
+  }
+
+
+  // ---------------- drawing ----------------
+  draw(){
+    drawBackground();
+    if (this.state === STATE_MENU) this.drawMenu();
+    else if (this.state === STATE_HIGHSCORES) this.drawHighscores();
+    else if (this.state === STATE_STAGE_SELECT) this.drawStageSelect();
+    else if (this.state===STATE_READY || this.state===STATE_PLAY || this.state===STATE_PAUSED){
+      this.drawPlayfield(); this.drawHud(); this.drawPauseButton();
+      if (this.state === STATE_READY){
+        const label = this.endless ? `ENDLESS - LEVEL ${this.stage-TOTAL_STAGES}` : `STAGE ${this.stage}`;
+        drawTextCenter(label, FONT_MED, YELLOW, WIDTH/2, HEIGHT/2-20);
+        drawTextCenter(IS_TOUCH ? "Get Ready! Tap to launch" : "Get Ready! SPACE / Click to launch", FONT_SMALL, WHITE, WIDTH/2, HEIGHT/2+25);
+      }
+      if (this.state === STATE_PAUSED){
+        ctx.fillStyle = rgb([0,0,0],170/255); ctx.fillRect(0,0,WIDTH,HEIGHT);
+        drawTextCenter("PAUSED", FONT_BIG, CYAN, WIDTH/2, 88);
+        for (const [,btn] of this.buildPauseButtons()) btn.draw(rectContains(btn,this.mouseLogical.x,this.mouseLogical.y));
+      } else if (this.resumeCooldown > 0){
+        ctx.fillStyle = rgb([0,0,0],130/255); ctx.fillRect(0,0,WIDTH,HEIGHT);
+        const count = Math.max(1, Math.ceil(this.resumeCooldown));
+        drawTextCenter(String(count), FONT_BIG, CYAN, WIDTH/2, HEIGHT/2, CYAN);
+        drawTextCenter("Get ready to move...", FONT_SMALL, WHITE, WIDTH/2, HEIGHT/2+60);
+      }
+    } else if (this.state === STATE_STAGE_CLEAR){
+      this.drawPlayfield(); this.drawHud();
+      ctx.fillStyle = rgb([0,0,0],160/255); ctx.fillRect(0,0,WIDTH,HEIGHT);
+      const clearTitle = this.endless ? `ENDLESS LEVEL ${this.stage-TOTAL_STAGES} CLEAR!` : `STAGE ${this.stage} CLEAR!`;
+      drawTextCenter(clearTitle, FONT_BIG, GREEN, WIDTH/2, HEIGHT/2-50, [0,60,20]);
+      drawTextCenter(`+${this.stageClearBonus} bonus`, FONT_MED, YELLOW, WIDTH/2, HEIGHT/2+10);
+      let nxt;
+      if (this.endless) nxt = IS_TOUCH ? "Tap for next level" : "Press SPACE / Click for next level";
+      else nxt = this.stage < TOTAL_STAGES ? (IS_TOUCH ? "Tap for next stage" : "Press SPACE / Click for next stage") : (IS_TOUCH ? "Tap to finish" : "Press SPACE / Click to finish");
+      drawTextCenter(nxt, FONT_SMALL, WHITE, WIDTH/2, HEIGHT/2+60);
+    } else if (this.state === STATE_GAME_OVER){
+      drawTextCenter("GAME OVER", FONT_BIG, RED, WIDTH/2, HEIGHT/2-60, [70,0,10]);
+      drawTextCenter(`Final Score: ${this.score}`, FONT_MED, WHITE, WIDTH/2, HEIGHT/2+5);
+      const reached = this.endless ? `Reached Endless Level ${this.stage-TOTAL_STAGES}` : `Reached Stage ${this.stage}`;
+      drawTextCenter(reached, FONT_SMALL, MAGENTA, WIDTH/2, HEIGHT/2+45);
+      if (this.isNewBest) drawTextCenter("NEW HIGH SCORE!", FONT_SMALL, YELLOW, WIDTH/2, HEIGHT/2+75);
+      else if (this.highscoreRank !== null) drawTextCenter(`Rank #${this.highscoreRank+1} high score`, FONT_TINY, CYAN, WIDTH/2, HEIGHT/2+75);
+      drawTextCenter(IS_TOUCH ? "Tap RESTART or MAIN MENU below" : "R = restart   ESC = main menu", FONT_SMALL, YELLOW, WIDTH/2, HEIGHT/2+110);
+      for (const [,btn] of this.buildEndButtons()) btn.draw(rectContains(btn,this.mouseLogical.x,this.mouseLogical.y));
+    } else if (this.state === STATE_VICTORY){
+      drawTextCenter("YOU CLEARED ALL 10 STAGES!", FONT_MED, GREEN, WIDTH/2, HEIGHT/2-60, [0,60,20]);
+      drawTextCenter(`Final Score: ${this.score}`, FONT_BIG, YELLOW, WIDTH/2, HEIGHT/2+10);
+      if (this.isNewBest) drawTextCenter("NEW HIGH SCORE!", FONT_SMALL, YELLOW, WIDTH/2, HEIGHT/2+55);
+      drawTextCenter(IS_TOUCH ? "Tap RESTART or MAIN MENU below" : "R = play again   ESC = main menu", FONT_SMALL, WHITE, WIDTH/2, HEIGHT/2+90);
+      for (const [,btn] of this.buildEndButtons()) btn.draw(rectContains(btn,this.mouseLogical.x,this.mouseLogical.y));
+    }
+  }
+
+  drawPlayfield(){
+    for (const brick of this.bricks) brick.draw();
+    for (const pu of this.powerups) pu.draw();
+    this.paddle.draw();
+    for (const b of this.balls) b.draw();
+    for (const p of this.particles) p.draw();
+    for (const laser of this.lasers) laser.draw();
+  }
+
+  drawHud(){
+    drawTextCenter(`SCORE ${this.score}`, FONT_SMALL, CYAN, 150, 20);
+    const stageText = this.endless ? `ENDLESS - LVL ${this.stage-TOTAL_STAGES}` : `STAGE ${this.stage}/${TOTAL_STAGES}`;
+    drawTextCenter(stageText, FONT_SMALL, MAGENTA, WIDTH/2, 20);
+
+    const heartsShown = Math.max(0, this.lives-1);
+    const livesTxt = ("LIVES " + "\u2665 ".repeat(heartsShown)).trim();
+    const livesColor = heartsShown === 0 ? heartbeatColor(performance.now()/1000) : RED;
+    drawTextCenter(livesTxt, FONT_SMALL, livesColor, WIDTH-110, 20);
+
+    if (this.timeExpired){
+      drawTextCenter("OVERTIME", FONT_SMALL, RED, WIDTH/2, 45);
+    } else {
+      const totalSec = Math.max(0, Math.floor(this.stageTimeLeft));
+      const mm = Math.floor(totalSec/60), ss = totalSec%60;
+      const color = this.stageTimeLeft < 10 ? RED : WHITE;
+      drawTextCenter(`${String(mm).padStart(2,"0")}:${String(ss).padStart(2,"0")}`, FONT_SMALL, color, WIDTH/2, 45);
+    }
+
+    const tags = [];
+    if (this.paddle.wideTimer > 0) tags.push([`WIDE ${this.paddle.wideTimer.toFixed(1)}s`, GREEN]);
+    if (this.paddle.shrinkTimer > 0) tags.push([`SHRUNK ${this.paddle.shrinkTimer.toFixed(1)}s`, RED]);
+    const slowLeft = Math.max(0, ...this.balls.filter(b=>b.slowTimer>0).map(b=>b.slowTimer));
+    if (slowLeft > 0) tags.push([`SLOW ${slowLeft.toFixed(1)}s`, BLUE]);
+    const fastLeft = Math.max(0, ...this.balls.filter(b=>b.fastTimer>0).map(b=>b.fastTimer));
+    if (fastLeft > 0) tags.push([`FAST ${fastLeft.toFixed(1)}s`, ORANGE]);
+    if (this.balls.length > 1) tags.push([`x${this.balls.length} BALLS`, MAGENTA]);
+    if (!SFX_ON) tags.push(["SFX OFF", GRAY]);
+    if (!BGM_ON) tags.push(["BGM OFF", GRAY]);
+    tags.forEach(([t,c], i) => drawTextCenter(t, FONT_TINY, c, 95+i*110, 70));
+  }
+
+  drawPauseButton(){
+    const r = PAUSE_BUTTON_RECT;
+    const hover = rectContains(r, this.mouseLogical.x, this.mouseLogical.y);
+    ctx.fillStyle = rgb(hover ? [55,55,90] : [28,28,45], 1);
+    roundRectPath(r.x, r.y, r.w, r.h, 6); ctx.fill();
+    ctx.strokeStyle = rgb(CYAN,1); ctx.lineWidth = 2;
+    roundRectPath(r.x+1, r.y+1, r.w-2, r.h-2, 6); ctx.stroke();
+    const cx = r.x+r.w/2, cy = r.y+r.h/2;
+    ctx.fillStyle = rgb(WHITE,1);
+    if (this.state === STATE_PAUSED){
+      ctx.beginPath(); ctx.moveTo(cx-5,cy-8); ctx.lineTo(cx-5,cy+8); ctx.lineTo(cx+8,cy); ctx.closePath(); ctx.fill();
+    } else {
+      ctx.fillRect(r.x+8, r.y+6, 5, 18);
+      ctx.fillRect(r.x+17, r.y+6, 5, 18);
+    }
+  }
+
+  buildPauseButtons(){
+    const w=260, h=50, gapX=20, gapY=12;
+    const resumeW=320, resumeH=54;
+    const buttons = [["resume", new Button(WIDTH/2-resumeW/2, 150-resumeH/2, resumeW, resumeH, "RESUME")]];
+    const colX = [WIDTH/2 - w - gapX/2, WIDTH/2 + gapX/2];
+    const y0 = 210;
+    const rowY = [y0, y0+h+gapY];
+    buttons.push(["restart_stage", new Button(colX[0], rowY[0], w, h, "RESTART STAGE")]);
+    buttons.push(["sfx", new Button(colX[1], rowY[0], w, h, "SOUND: "+(SFX_ON?"ON":"OFF"))]);
+    buttons.push(["fullscreen", new Button(colX[0], rowY[1], w, h, "FULLSCREEN: "+(CONFIG.fullscreen?"ON":"OFF"))]);
+    buttons.push(["bgm", new Button(colX[1], rowY[1], w, h, "BGM: "+(BGM_ON?"ON":"OFF"))]);
+    const mmY = rowY[1]+h+gapY + resumeH/2;
+    buttons.push(["main_menu", new Button(WIDTH/2-resumeW/2, mmY-resumeH/2, resumeW, resumeH, "MAIN MENU")]);
+    return buttons;
+  }
+
+  buildEndButtons(){
+    const w=220, h=50, gap=16; const x0=WIDTH/2-(w*2+gap)/2; const y=HEIGHT/2+140;
+    return [["restart", new Button(x0,y,w,h,"RESTART")], ["main_menu", new Button(x0+w+gap,y,w,h,"MAIN MENU")]];
+  }
+
+  buildMenuButtons(){
+    const buttons = [];
+    const singleW=300, singleH=46;
+    buttons.push(["start", new Button(WIDTH/2-singleW/2, 165-singleH/2, singleW, singleH, "START")]);
+    const maxStage = CONFIG.max_stage_reached || 1;
+    const continueLabel = maxStage>1 ? `CONTINUE (STAGE ${maxStage})` : "CONTINUE";
+    buttons.push(["continue", new Button(WIDTH/2-singleW/2, 220-singleH/2, singleW, singleH, continueLabel, maxStage>1)]);
+    const completed = !!CONFIG.game_completed;
+    buttons.push(["stage_select", new Button(WIDTH/2-singleW/2, 275-singleH/2, singleW, singleH, "STAGE SELECT", completed)]);
+
+    const w=260, h=54, gapX=20, gapY=14;
+    const colX = [WIDTH/2 - w - gapX/2, WIDTH/2 + gapX/2];
+    const row0Y=312, row1Y=row0Y+h+gapY, row2Y=row1Y+h+gapY;
+    buttons.push(["highscores", new Button(colX[0], row0Y, w, h, "CHECK HIGH SCORE")]);
+    buttons.push(["endless", new Button(colX[1], row0Y, w, h, "ENDLESS MODE", completed)]);
+    buttons.push(["fullscreen", new Button(colX[0], row1Y, w, h, "FULLSCREEN: "+(CONFIG.fullscreen?"ON":"OFF"))]);
+    buttons.push(["bgm", new Button(colX[1], row1Y, w, h, "BGM: "+(BGM_ON?"ON":"OFF"))]);
+    buttons.push(["sfx", new Button(colX[0], row2Y, w*2+gapX, h, "SOUND: "+(SFX_ON?"ON":"OFF"))]);
+    return buttons;
+  }
+
+  handleMenuAction(action){
+    if (action==="start") this.resetFull();
+    else if (action==="continue"){ if ((CONFIG.max_stage_reached||1)>1) this.continueGame(); }
+    else if (action==="highscores"){ this.highscores = loadHighscores(); this.state = STATE_HIGHSCORES; }
+    else if (action==="stage_select"){ if (CONFIG.game_completed) this.state = STATE_STAGE_SELECT; }
+    else if (action==="endless"){ if (CONFIG.game_completed) this.startEndless(); }
+    else if (action==="fullscreen") toggleFullscreen();
+    else if (action==="bgm") setBgm(!BGM_ON);
+    else if (action==="sfx") setSfx(!SFX_ON);
+    playSound("ui_click");
+  }
+
+  drawMenu(){
+    drawTextCenter("NEON BREAKOUT", FONT_BIG, CYAN, WIDTH/2, 70, [0,60,70]);
+    drawTextCenter("10 stages. Rare power-ups. Patience required.", FONT_SMALL, WHITE, WIDTH/2, 118);
+    for (const [,btn] of this.buildMenuButtons()) btn.draw(rectContains(btn,this.mouseLogical.x,this.mouseLogical.y));
+    const controlHint = IS_TOUCH ? "Drag to move  \u2022  Tap to launch  \u2022  Tap the pause icon to pause" : "Arrows/A-D or Mouse to move  \u2022  SPACE/Click to launch  \u2022  P/ESC to pause";
+    drawTextCenter(controlHint, FONT_TINY, GRAY, WIDTH/2, 532);
+    if (!IS_TOUCH) drawTextCenter("Ctrl / Alt shows or hides the mouse cursor during play", FONT_TINY, GRAY, WIDTH/2, 554);
+    drawTextCenter("made with \u2665 by Rane Kun", FONT_TINY, GRAY, WIDTH/2, HEIGHT-24);
+  }
+
+  buildHighscoresButtons(){ return [["back", new Button(WIDTH/2-100, HEIGHT-70-25, 200, 50, "BACK")]]; }
+  drawHighscores(){
+    drawTextCenter("HIGH SCORES", FONT_BIG, CYAN, WIDTH/2, 90, [0,60,70]);
+    if (this.highscores.length){
+      for (let i=0;i<Math.min(8,this.highscores.length);i++){
+        const entry = this.highscores[i];
+        let stageLabel;
+        if (entry.endless){ const loopNum = Math.max(1, entry.stage-TOTAL_STAGES); stageLabel = `Endless (loop ${loopNum})`; }
+        else stageLabel = `Stage ${entry.stage}`;
+        drawTextCenter(`${i+1}.  ${entry.score}  -  ${stageLabel}`, FONT_SMALL, WHITE, WIDTH/2, 170+i*38);
+      }
+    } else {
+      drawTextCenter("No scores yet - go play!", FONT_SMALL, GRAY, WIDTH/2, 200);
+    }
+    for (const [,btn] of this.buildHighscoresButtons()) btn.draw(rectContains(btn,this.mouseLogical.x,this.mouseLogical.y));
+  }
+
+  buildStageSelectButtons(){
+    const buttons = [];
+    const cols=5, btnW=140, btnH=80, gap=20;
+    const totalW = cols*btnW + (cols-1)*gap;
+    const startX = WIDTH/2 - totalW/2, startY=220;
+    const unlocked = !!CONFIG.game_completed;
+    for (let i=0;i<TOTAL_STAGES;i++){
+      const col=i%cols, row=Math.floor(i/cols);
+      buttons.push([`stage_${i+1}`, new Button(startX+col*(btnW+gap), startY+row*(btnH+gap), btnW, btnH, `STAGE ${i+1}`, unlocked)]);
+    }
+    buttons.push(["back", new Button(WIDTH/2-100, startY+2*(btnH+gap)+40-25, 200, 50, "BACK")]);
+    return buttons;
+  }
+  drawStageSelect(){
+    drawTextCenter("STAGE SELECT", FONT_BIG, CYAN, WIDTH/2, 100, [0,60,70]);
+    if (!CONFIG.game_completed) drawTextCenter("Clear all 10 stages to unlock", FONT_SMALL, GRAY, WIDTH/2, 160);
+    for (const [,btn] of this.buildStageSelectButtons()) btn.draw(rectContains(btn,this.mouseLogical.x,this.mouseLogical.y));
+  }
+
+  // ---------------- input ----------------
+  handleLaunch(){
+    if (this.resumeCooldown > 0) return;
+    if (this.state === STATE_READY || this.state === STATE_PLAY){
+      let launchedAny = false;
+      for (const b of this.balls){ if (b.stuck){ b.launchFrom(this.paddle); launchedAny = true; } }
+      if (launchedAny){
+        playSound("launch");
+        if (this.state === STATE_READY){ this.readyTimer = 0.0; this.state = STATE_PLAY; }
+      }
+    } else if (this.state === STATE_MENU){
+      this.resetFull();
+      playSound("ui_click");
+    } else if (this.state === STATE_STAGE_CLEAR){
+      playSound("ui_click");
+      this.nextStage();
+    }
+  }
+
+  handleKeydown(code){
+    if (code === "Escape"){
+      if (this.state === STATE_MENU){ /* no native quit on web */ }
+      else if (this.state===STATE_HIGHSCORES || this.state===STATE_STAGE_SELECT){ this.state = STATE_MENU; playSound("ui_click"); }
+      else if (this.state===STATE_PLAY || this.state===STATE_READY || this.state===STATE_PAUSED) this.togglePause();
+      else if (this.state===STATE_GAME_OVER || this.state===STATE_VICTORY || this.state===STATE_STAGE_CLEAR){
+        this.finalizeScore(); this.state = STATE_MENU; playSound("ui_click");
+      }
+      return;
+    }
+    if (code === "Space") this.handleLaunch();
+    if (code === "KeyP" && (this.state===STATE_PLAY || this.state===STATE_PAUSED || this.state===STATE_READY)) this.togglePause();
+    if (code === "KeyR" && (this.state===STATE_GAME_OVER || this.state===STATE_VICTORY)){
+      if (this.endless) this.startEndless(); else this.resetFull();
+    }
+    if (code === "KeyM") quickToggleMute();
+    if (["ControlLeft","ControlRight","AltLeft","AltRight"].includes(code)){
+      if (this.state===STATE_PLAY || this.state===STATE_READY || this.state===STATE_PAUSED) this.cursorOverrideVisible = !this.cursorOverrideVisible;
+    }
+  }
+
+  handlePrimaryClick(pos){
+    if (this.state === STATE_MENU){
+      for (const [action,btn] of this.buildMenuButtons()) if (btn.hit(pos.x,pos.y)){ this.handleMenuAction(action); return; }
+      return;
+    }
+    if (this.state === STATE_HIGHSCORES){
+      for (const [,btn] of this.buildHighscoresButtons()) if (btn.hit(pos.x,pos.y)){ this.state=STATE_MENU; playSound("ui_click"); return; }
+      return;
+    }
+    if (this.state === STATE_STAGE_SELECT){
+      for (const [action,btn] of this.buildStageSelectButtons()) if (btn.hit(pos.x,pos.y)){
+        if (action==="back") this.state = STATE_MENU;
+        else if (action.startsWith("stage_")) this.startAtStage(parseInt(action.split("_")[1],10));
+        playSound("ui_click"); return;
+      }
+      return;
+    }
+    if (this.state === STATE_PAUSED){
+      for (const [action,btn] of this.buildPauseButtons()) if (btn.hit(pos.x,pos.y)){
+        if (action==="resume") this.togglePause();
+        else if (action==="main_menu"){ this.finalizeScore(); this.state=STATE_MENU; playSound("ui_click"); }
+        else if (action==="restart_stage"){ this.restartStage(); playSound("ui_click"); }
+        else this.handleMenuAction(action);
+        return;
+      }
+      return;
+    }
+    if ((this.state===STATE_READY || this.state===STATE_PLAY) && rectContains(PAUSE_BUTTON_RECT, pos.x, pos.y)){
+      this.togglePause(); return;
+    }
+    if (this.state === STATE_STAGE_CLEAR){ playSound("ui_click"); this.nextStage(); return; }
+    if (this.state === STATE_GAME_OVER || this.state === STATE_VICTORY){
+      for (const [action,btn] of this.buildEndButtons()) if (btn.hit(pos.x,pos.y)){
+        playSound("ui_click");
+        if (action==="restart"){ if (this.endless) this.startEndless(); else this.resetFull(); }
+        else { this.finalizeScore(); this.state = STATE_MENU; }
+        return;
+      }
+      return;
+    }
+    this.handleLaunch();
+  }
+}
+
+// --------------------------------------------------------------------------
+// FULLSCREEN - driven solely by the browser's own fullscreenchange event, so
+// the button always reflects reality (a request can be silently blocked in
+// some embedded/sandboxed contexts - optimistically setting state based on
+// what was merely *requested* leaves the label permanently wrong if so).
+// --------------------------------------------------------------------------
+function toggleFullscreen(){
+  try {
+    if (!document.fullscreenElement && !document.webkitFullscreenElement){
+      const el = stageEl;
+      const req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
+      if (req) req.call(el);
+    } else {
+      const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen;
+      if (exit) exit.call(document);
+    }
+  } catch(e){ log("Fullscreen toggle failed", e); }
+}
+function _onFullscreenChange(){
+  CONFIG.fullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
+  saveConfig(CONFIG);
+  setTimeout(checkOrientation, 60);
+}
+document.addEventListener("fullscreenchange", _onFullscreenChange);
+document.addEventListener("webkitfullscreenchange", _onFullscreenChange);
+
+// --------------------------------------------------------------------------
+// ROTATE PROMPT - landscape-native game (unlike the portrait-native Void
+// Breaker), so a phone held upright gets a blocking prompt instead of a
+// squeezed reflow.
+// --------------------------------------------------------------------------
+const rotatePromptEl = document.getElementById("rotate-prompt");
+let _inRotatePrompt = false;
+function isPortraitBlocked(){ return IS_TOUCH && window.innerHeight > window.innerWidth; }
+function checkOrientation(){
+  const shouldShow = isPortraitBlocked();
+  if (shouldShow !== _inRotatePrompt){
+    _inRotatePrompt = shouldShow;
+    rotatePromptEl.classList.toggle("visible", shouldShow);
+    if (shouldShow && game && (game.state === STATE_PLAY || game.state === STATE_READY)) game.togglePause();
+  }
+  const safeToResize = !game || [STATE_MENU, STATE_HIGHSCORES, STATE_STAGE_SELECT, STATE_GAME_OVER, STATE_VICTORY].includes(game.state);
+  if (safeToResize) applyDynamicResolution();
+  else resizeCanvas();
+}
+window.addEventListener("resize", checkOrientation);
+window.addEventListener("orientationchange", () => setTimeout(checkOrientation, 60));
+
+// --------------------------------------------------------------------------
+// INPUT - keyboard, mouse, and a touch layer that tracks one specific finger
+// by its touch identifier (a second touch - a resting palm, the other hand -
+// is ignored entirely rather than being allowed to hijack the paddle).
+// --------------------------------------------------------------------------
+const keys = {};
+let mousePos = { x: WIDTH/2, y: HEIGHT/2 };
+let lastMousePos = { x: WIDTH/2, y: HEIGHT/2 };
+let primaryTouchId = null;
+let touchActive = false;
+
+function isGameplayTouchState(state){ return state === STATE_READY || state === STATE_PLAY; }
+
+window.addEventListener("keydown", (e) => {
+  unlockAudio();
+  if (!keys[e.code]) game.handleKeydown(e.code);
+  keys[e.code] = true;
+  if (["Space","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.code)) e.preventDefault();
+});
+window.addEventListener("keyup", (e) => { keys[e.code] = false; });
+
+canvas.addEventListener("mousemove", (e) => { mousePos = clientToLogical(e.clientX, e.clientY); });
+canvas.addEventListener("mousedown", (e) => {
+  unlockAudio();
+  if (e.button !== 0) return;
+  game.handlePrimaryClick(clientToLogical(e.clientX, e.clientY));
+});
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+canvas.addEventListener("touchstart", (e) => {
+  e.preventDefault();
+  unlockAudio();
+  const t0 = e.changedTouches[0];
+  const pos0 = clientToLogical(t0.clientX, t0.clientY);
+  if (!isGameplayTouchState(game.state)){ game.handlePrimaryClick(pos0); return; }
+  if (rectContains(PAUSE_BUTTON_RECT, pos0.x, pos0.y)){ game.togglePause(); return; }
+  if (primaryTouchId !== null) return; // ignore any additional simultaneous touch
+  primaryTouchId = t0.identifier;
+  touchActive = true;
+  mousePos = pos0;
+  game.handleLaunch();
+}, { passive: false });
+
+canvas.addEventListener("touchmove", (e) => {
+  e.preventDefault();
+  if (!touchActive || primaryTouchId === null) return;
+  for (const t of e.changedTouches){
+    if (t.identifier === primaryTouchId){ mousePos = clientToLogical(t.clientX, t.clientY); break; }
+  }
+}, { passive: false });
+
+function _releasePrimaryTouchIfMatched(e){
+  if (primaryTouchId === null) return;
+  for (const t of e.changedTouches){
+    if (t.identifier === primaryTouchId){ primaryTouchId = null; touchActive = false; break; }
+  }
+}
+canvas.addEventListener("touchend", (e) => { e.preventDefault(); _releasePrimaryTouchIfMatched(e); }, { passive: false });
+canvas.addEventListener("touchcancel", (e) => { e.preventDefault(); _releasePrimaryTouchIfMatched(e); }, { passive: false });
+
+function saveOnExit(){
+  try {
+    if (game) game.finalizeScore();
+    saveConfig(CONFIG);
+  } catch(e){}
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden){
+    saveOnExit();
+    if (game && isGameplayTouchState(game.state)) game.togglePause();
+  }
+});
+window.addEventListener("pagehide", saveOnExit);
+window.addEventListener("beforeunload", saveOnExit);
+
+// --------------------------------------------------------------------------
+// MAIN LOOP
+// --------------------------------------------------------------------------
+let lastTime = 0;
+let game = null;
+let _lastFrameErrorLogged = 0;
+
+function frame(now){
+  // Checked fresh every frame, independent of resize/orientationchange event
+  // timing (which some mobile browsers fire inconsistently) - this is what
+  // actually guarantees portrait can never sneak back into active play,
+  // rather than only reacting once when a resize event happens to fire.
+  const blocked = isPortraitBlocked();
+  if (blocked !== _inRotatePrompt){
+    _inRotatePrompt = blocked;
+    rotatePromptEl.classList.toggle("visible", blocked);
+    if (blocked && game && (game.state === STATE_PLAY || game.state === STATE_READY)) game.togglePause();
+  }
+  if (blocked){
+    lastTime = now;
+    requestAnimationFrame(frame);
+    return;
+  }
+
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  if (!isFinite(dt) || dt < 0) dt = 0;
+  dt = Math.min(dt, 0.05);
+
+  let shakeX = 0, shakeY = 0;
+  if (game.state !== STATE_PAUSED && game.shakeTimeLeft > 0){
+    let amt = game.shakeMagnitude * (game.shakeTimeLeft / Math.max(0.001, game.shakeDurationTotal));
+    if (game.timeExpired && game.state === STATE_PLAY) amt = Math.max(amt, 3.5);
+    shakeX = (Math.random()*2-1) * amt;
+    shakeY = (Math.random()*2-1) * amt;
+  }
+
+  const mouseMoved = (mousePos.x !== lastMousePos.x);
+
+  // Defensive: one bad frame should never be able to permanently freeze the
+  // whole game the way an uncaught exception did during Void Breaker's dev
+  // cycle. Log it, skip the frame, keep the loop alive.
+  try {
+    ctx.save();
+    ctx.translate(shakeX, shakeY);
+    game.update(dt, keys, mousePos, mouseMoved);
+    lastMousePos = { x: mousePos.x, y: mousePos.y };
+    game.draw();
+    ctx.restore();
+  } catch(err){
+    try { ctx.restore(); } catch(e2){}
+    const nowMs = performance.now();
+    if (nowMs - _lastFrameErrorLogged > 2000){ _lastFrameErrorLogged = nowMs; log("Frame error (recovered):", err); }
+  }
+
+  const shouldHideCursor = isGameplayTouchState(game.state) && !game.cursorOverrideVisible;
+  canvas.style.cursor = (shouldHideCursor && !IS_TOUCH) ? "none" : "default";
+
+  requestAnimationFrame(frame);
+}
+
+// --------------------------------------------------------------------------
+// BOOT - staged with setTimeout (a real macrotask, so the browser actually
+// paints between steps - chained requestAnimationFrame calls can get
+// batched together without an intervening paint, which is what made loading
+// look frozen during Void Breaker's first pass). SFX build fast and block
+// the loading screen briefly; the ~2 minute music track builds in small
+// chunks in the background, well after the menu is already interactive.
+// --------------------------------------------------------------------------
+function setLoadingProgress(pct, text){
+  const bar = document.getElementById("loading-bar");
+  const sub = document.getElementById("loading-sub");
+  if (bar) bar.style.width = pct + "%";
+  if (sub && text) sub.textContent = text;
+}
+
+function boot(){
+  applyDynamicResolution();
+  checkOrientation();
+  setLoadingProgress(15, "preparing...");
+  setTimeout(() => {
+    setLoadingProgress(45, "building the arena...");
+    setTimeout(() => {
+      setLoadingProgress(70, "loading sound effects...");
+      setTimeout(() => {
+        try { buildSfxAssets(); } catch(e){ log("SFX build failed", e); SOUND_ENABLED = false; }
+        setLoadingProgress(100, "ready");
+        setTimeout(() => {
+          game = new Game();
+          window.game = game; // exposed for debugging/inspection via the browser console
+          window.VB_DEBUG = { game, CONFIG,
+            get soundEnabled(){ return SOUND_ENABLED; }, get soundCount(){ return Object.keys(SOUNDS).length; }, get musicReady(){ return !!musicBuffer; } };
+          const loadingEl = document.getElementById("loading");
+          if (loadingEl) loadingEl.classList.add("hidden");
+          lastTime = performance.now();
+          requestAnimationFrame(frame);
+          setTimeout(() => buildMusicAsync(), 120);
+        }, 16);
+      }, 16);
+    }, 16);
+  }, 16);
+}
+
+if (document.readyState === "complete" || document.readyState === "interactive"){
+  setTimeout(boot, 0);
+} else {
+  window.addEventListener("DOMContentLoaded", boot);
+}
+</script>
+</body>
+</html>
