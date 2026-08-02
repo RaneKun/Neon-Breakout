@@ -1813,7 +1813,7 @@ class Game:
         self.spawn_particles(rect.centerx, rect.centery, color, 10 if broke else 5)
 
         if broke:
-            self.score += 10 * brick.max_hp * self.stage_score_mult()
+            self.score += round(10 * brick.max_hp * self.stage_score_mult())
             play_sound("brick_break")
             log(f"Brick destroyed at ({rect.x}, {rect.y}). New score: {self.score}")
         else:
@@ -2161,8 +2161,9 @@ class Game:
 
     def draw_hud(self):
         s = SCALE
+        score_text = f"SCORE {self.score}"
         draw_text_center(
-            screen, f"SCORE {self.score}", FONT_SMALL, CYAN, (round(150 * s), round(20 * s))
+            screen, score_text, FONT_SMALL, CYAN, (round(150 * s), round(20 * s))
         )
         stage_hud_text = (
             f"ENDLESS - LVL {self.stage - TOTAL_STAGES}"
@@ -2212,8 +2213,27 @@ class Game:
             tags.append(("SFX OFF", GRAY))
         if not BGM_ON:
             tags.append(("BGM OFF", GRAY))
-        for i, (t, c) in enumerate(tags):
-            draw_text_center(screen, t, FONT_TINY, c, (round((95 + i * 110) * s), round(70 * s)))
+        # Placed directly beside the SCORE text (same header row) instead of
+        # below it, since a fixed row at BRICK_TOP used to sit right on top
+        # of the first row of bricks. Tags wrap onto extra lines within the
+        # header if needed, but never drop below BRICK_TOP.
+        if tags:
+            score_w, _ = FONT_SMALL.size(score_text)
+            stage_w, _ = FONT_SMALL.size(stage_hud_text)
+            start_x = round(150 * s) + score_w // 2 + round(14 * s)
+            wrap_x = WIDTH // 2 - stage_w // 2 - round(14 * s)
+            line_gap = round(16 * s)
+            max_y = BRICK_TOP - round(10 * s)
+            x, y = start_x, round(20 * s)
+            for t, c in tags:
+                tag_w, _ = FONT_TINY.size(t)
+                if x + tag_w > wrap_x and x > start_x:
+                    x = start_x
+                    y += line_gap
+                    if y > max_y:
+                        break  # out of safe header space; drop overflow rather than hit the bricks
+                draw_text_center(screen, t, FONT_TINY, c, (x + tag_w // 2, y))
+                x += tag_w + round(14 * s)
 
     def draw_play_elements(self):
         for brick in self.bricks:
