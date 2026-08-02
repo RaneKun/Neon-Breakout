@@ -21,7 +21,7 @@
 ### ⚡ Power-Ups (Rare & Random)
 | Power-Up | Effect | Rarity |
 |----------|--------|--------|
-| 🔵 **Widen** | Paddle grows for 9 seconds | Medium |
+| 🟢 **Widen** | Paddle grows for 9 seconds | Medium |
 | 🟣 **Multiball** | 3 balls launch simultaneously | High |
 | 🔷 **Slow** | Ball speed reduced for 6 seconds | Medium |
 | ⚪ **Extra Life** | +1 life (max 6) | Medium |
