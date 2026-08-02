@@ -1668,7 +1668,8 @@ class Game {
   }
 
   drawHud(){
-    drawTextCenter(`SCORE ${this.score}`, FONT_SMALL, CYAN, 150, 20);
+    const scoreText = `SCORE ${this.score}`;
+    drawTextCenter(scoreText, FONT_SMALL, CYAN, 150, 20);
     const stageText = this.endless ? `ENDLESS - LVL ${this.stage-TOTAL_STAGES}` : `STAGE ${this.stage}/${TOTAL_STAGES}`;
     drawTextCenter(stageText, FONT_SMALL, MAGENTA, WIDTH/2, 20);
 
@@ -1696,7 +1697,32 @@ class Game {
     if (this.balls.length > 1) tags.push([`x${this.balls.length} BALLS`, MAGENTA]);
     if (!SFX_ON) tags.push(["SFX OFF", GRAY]);
     if (!BGM_ON) tags.push(["BGM OFF", GRAY]);
-    tags.forEach(([t,c], i) => drawTextCenter(t, FONT_TINY, c, 95+i*110, 70));
+
+    // Placed directly beside the SCORE text (same header row) instead of
+    // below it, since a fixed row at BRICK_TOP used to sit right on top of
+    // the first row of bricks. Tags wrap onto extra lines within the header
+    // if needed, but never drop below BRICK_TOP.
+    if (tags.length){
+      ctx.font = FONT_SMALL;
+      const scoreW = ctx.measureText(scoreText).width;
+      const stageW = ctx.measureText(stageText).width;
+      const startX = 150 + scoreW/2 + 14;
+      const wrapX = WIDTH/2 - stageW/2 - 14;
+      const lineGap = 16;
+      const maxY = BRICK_TOP - 10;
+      ctx.font = FONT_TINY;
+      let x = startX, y = 20;
+      for (const [t, c] of tags){
+        const tagW = ctx.measureText(t).width;
+        if (x + tagW > wrapX && x > startX){
+          x = startX;
+          y += lineGap;
+          if (y > maxY) break; // out of safe header space; drop overflow rather than hit the bricks
+        }
+        drawTextCenter(t, FONT_TINY, c, x + tagW/2, y);
+        x += tagW + 14;
+      }
+    }
   }
 
   drawPauseButton(){
@@ -2079,7 +2105,7 @@ function frame(now){
   }
 
   const shouldHideCursor = isGameplayTouchState(game.state) && !game.cursorOverrideVisible;
-  canvas.style.cursor = (shouldHideCursor && !IS_TOUCH) ? "none" : "default";
+  canvas.style.cursor = shouldHideCursor ? "none" : "default";
 
   requestAnimationFrame(frame);
 }
