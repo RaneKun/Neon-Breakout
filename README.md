@@ -1,4 +1,4 @@
-# 🎮 [NEON BREAKOUT](https://ranekun.github.io/Neon-Breakout/)
+# 🎮 [NEON BREAKOUT](https://ranekun.github.io/Neon-Breakout/) <-- Click to play the game! 🕹️
 
 ![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)
 ![Pygame](https://img.shields.io/badge/pygame-2.0+-green.svg)
@@ -9,7 +9,7 @@
 ---
 <img width="2560" height="1440" alt="GraalVM17 Screenshot 2026 07 18 - 21 10 23 27" src="https://github.com/user-attachments/assets/d30f511d-94b3-4717-a6a4-12570f0eadb9" />
 
-Also try out 🚀[Void Breaker](https://ranekun.github.io/Void-Breaker/)
+Also try out 🚀[Void Breaker](https://github.com/RaneKun/Void-Breaker)
 
 ## 🌟 Features
 
@@ -47,6 +47,12 @@ Also try out 🚀[Void Breaker](https://ranekun.github.io/Void-Breaker/)
 | Restart | R (on Game Over / Victory) |
 | Quick Mute | M |
 | Quit | ESC (from main menu) |
+
+### ⚙️ Cheats
+| Code (case sensitive) | Function |
+|--------|--------------|
+| Keqing | Unlocks **stage select** and **endless mode** |
+| Keqing is GOAT | Does the above + **Infinite Lives** and **Wide Bar** |
 
 ---
 
