@@ -232,11 +232,9 @@ PENDING_RESOLUTION = (WIDTH, HEIGHT)  # updated on resize/fullscreen; applied at
 screen = pygame.Surface((WIDTH, HEIGHT))  # everything is drawn onto this
 window = None  # the real OS window - created by apply_fullscreen() below
 
-# NOTE: an earlier version used pygame._sdl2.video.Window to reposition the window
-# after a fullscreen switch. That experimental API caused hard native crashes (no
-# traceback, uncatchable) when toggling fullscreen on some systems, so it's been
-# removed - positioning now goes through the SDL_VIDEO_WINDOW_POS env var hint
-# (see apply_fullscreen) using only the classic pygame.display.set_mode() call.
+# Window repositioning goes through the SDL_VIDEO_WINDOW_POS env var hint (see
+# apply_fullscreen) rather than any SDL window-handle API, since env-var placement
+# is honored reliably by set_mode() across platforms with no extra native calls.
 
 
 def _native_desktop_size():
@@ -302,13 +300,11 @@ def apply_fullscreen(on):
     """Switch between a resizable window (restored to its last size/position) and
     a borderless fullscreen window sized to the monitor's native resolution.
 
-    NOTE: pygame._sdl2.video.Window was tried twice here (for the mode switch itself,
-    then just for repositioning) and both times caused hard, uncatchable native crashes
-    when toggling fullscreen on. The fix is to never touch it: fully tear down and
-    recreate the display subsystem (display.quit() + .init()) before every switch, so
-    set_mode() always creates a genuinely new window and SDL_VIDEO_WINDOW_POS is honored
-    with no repositioning call needed. Every step below is wrapped so a failure can
-    never leave `window` as None - it always ends in some valid state."""
+    Fully tears down and recreates the display subsystem (display.quit() + .init())
+    before every switch, so set_mode() always creates a genuinely new window and
+    SDL_VIDEO_WINDOW_POS is honored without any separate repositioning call. Every
+    step below is wrapped so a failure can never leave `window` as None - it always
+    ends in some valid state."""
     global window
 
     try:
@@ -410,9 +406,9 @@ GRAY = (120, 125, 140)
 HP_COLORS = {1: CYAN, 2: YELLOW, 3: ORANGE, 4: RED}
 
 POWERUP_INFO = {
-    # key: (letter, color, rarity_weight) - weighted toward the "special" ones
-    # now that powerups spawn randomly on a timer instead of falling from
-    # nearly every broken brick (which is what made them feel too common).
+    # key: (letter, color, rarity_weight). Power-ups spawn at random points on a
+    # timer, keeping their appearance rare and deliberate; weighting is tuned
+    # toward the higher-impact "special" kinds.
     "widen": ("W", GREEN, 4),
     "multiball": ("M", MAGENTA, 6),
     "slow": ("S", BLUE, 5),
@@ -1033,6 +1029,9 @@ class Paddle:
         self.wide_timer = 0.0
         self.shrink_timer = 0.0
         self.speed = PADDLE_SPEED
+        # Session-only cheat flag (never persisted); reapplied by Game right
+        # after this object is constructed (see Game._new_paddle).
+        self.cheat_infinite_wide = False
 
     @property
     def rect(self):
@@ -1040,7 +1039,7 @@ class Paddle:
 
     def apply_width(self):
         # Handle smooth transition between normal, wide, and shrunk sizes
-        if self.wide_timer > 0:
+        if self.wide_timer > 0 or self.cheat_infinite_wide:
             target = PADDLE_W_WIDE
         elif self.shrink_timer > 0:
             target = PADDLE_W_SHRUNK
@@ -1080,7 +1079,7 @@ class Paddle:
         self.wide_timer = 0.0
 
     def draw(self, surface):
-        color = GREEN if self.wide_timer > 0 else (RED if self.shrink_timer > 0 else CYAN)
+        color = GREEN if (self.wide_timer > 0 or self.cheat_infinite_wide) else (RED if self.shrink_timer > 0 else CYAN)
         draw_glow_rect(surface, self.rect, color, radius=8)
 
 
@@ -1214,9 +1213,9 @@ class Brick:
 
 
 class PowerUp:
-    """Now spawned at random points on screen on a timer (see Game.spawn_random_powerup),
-    rather than dropping from almost every broken brick. Expires (disappears) if not
-    caught in time, whether or not it has reached the bottom of the screen."""
+    """Spawned at random points on screen on a timer (see Game.spawn_random_powerup).
+    Expires (disappears) if not caught in time, whether or not it has reached the
+    bottom of the screen."""
 
     LIFESPAN = 9.0
 
@@ -1550,9 +1549,31 @@ class Game:
         self.resume_cooldown = 0.0
         self.score = 0
         self.stage = 1
+
+        # ---- cheat codes (session-only: never saved to CONFIG, cleared on relaunch) ----
+        self.cheat_unlock = False  # unlocks stage select + endless mode
+        self.cheat_infinite_lives = False
+        self.cheat_infinite_wide = False
+        self.cheat_prompt_open = False
+        self.cheat_input_text = ""
+        self.cheat_wrong = False
+        self.cheat_shake_timer = 0.0
+        self.cheat_shake_total = 0.35
+        self.cheat_just_activated = 0.0
+        self._cheat_field_rect = None
+        self._cheat_blink_t = 0.0
+
         log("Game initialized, entering menu state.")
         self.reset_full()
         self.state = STATE_MENU  # start on the menu, not straight into READY
+
+    def _new_paddle(self):
+        """Creates a fresh Paddle and reapplies any active session cheats onto it -
+        used everywhere the paddle is (re)created so cheats survive stage
+        transitions/respawns within the same session but never get saved."""
+        pd = Paddle()
+        pd.cheat_infinite_wide = self.cheat_infinite_wide
+        return pd
 
     def _begin_new_run(self):
         """Closes out whatever run was previously in progress (saving it if it hadn't
@@ -1570,7 +1591,7 @@ class Game:
         self.endless = False
         self.score = 0
         self.lives = 4  # 3 hearts shown at start (hearts displayed = lives - 1)
-        self.paddle = Paddle()
+        self.paddle = self._new_paddle()
         self.balls = []
         self.bricks = []
         self.powerups = []
@@ -1642,7 +1663,7 @@ class Game:
             self._last_endless_pattern = self.cfg["pattern"]
         else:
             self.bricks, self.cfg = build_bricks(stage)
-        self.paddle = Paddle()
+        self.paddle = self._new_paddle()
         self.powerups.clear()
         self.particles.clear()
         self.stage_speed_mult = 1.0
@@ -1689,8 +1710,10 @@ class Game:
             pool = [k for k in POWERUP_KEYS if k not in ("slow", "shrink")]
         else:
             pool = list(POWERUP_KEYS)
-        if self.lives >= MAX_LIVES:
+        if self.lives >= MAX_LIVES or self.cheat_infinite_lives:
             pool = [k for k in pool if k != "life"]
+        if self.cheat_infinite_wide:
+            pool = [k for k in pool if k != "widen"]
         if not pool:
             return
         weights = [POWERUP_INFO[k][2] for k in pool]
@@ -1736,8 +1759,8 @@ class Game:
         )
 
     def maybe_drop_powerup(self, brick):
-        # Bricks no longer drop power-ups directly (see spawn_random_powerup) - kept as a
-        # harmless no-op in case anything still calls it.
+        # Reserved hook for brick-triggered drops; power-up spawning itself is driven
+        # on a timer by Game.spawn_random_powerup, independent of brick breaks.
         pass
 
     def apply_powerup(self, kind):
@@ -1878,6 +1901,11 @@ class Game:
     # ---------------- update ----------------
     def update(self, dt, keys, mouse_pos, mouse_moved):
         self._autosave_tick(dt)
+        self._cheat_blink_t += dt
+        if self.cheat_shake_timer > 0:
+            self.cheat_shake_timer = max(0.0, self.cheat_shake_timer - dt)
+        if self.cheat_just_activated > 0:
+            self.cheat_just_activated = max(0.0, self.cheat_just_activated - dt)
         self.mouse_logical = mouse_pos
         if mouse_moved:
             self.mouse_control_active = True
@@ -1970,7 +1998,8 @@ class Game:
             if laser.state == "firing" and not laser.hit_applied:
                 if laser.rect().colliderect(self.paddle.rect):
                     laser.hit_applied = True
-                    self.lives -= 1
+                    if not self.cheat_infinite_lives:
+                        self.lives -= 1
                     play_sound("laser_hit")
                     self.spawn_particles(
                         self.paddle.x + self.paddle.width / 2, self.paddle.y, RED, 20
@@ -2075,16 +2104,19 @@ class Game:
                 log(f"Powerup '{pu.kind}' expired/missed.")
 
         if not self.balls:
-            self.lives -= 1
-            play_sound("life_lost")
-            log(f"All balls lost. Lives reduced to {self.lives}")
+            if not self.cheat_infinite_lives:
+                self.lives -= 1
+                play_sound("life_lost")
+                log(f"All balls lost. Lives reduced to {self.lives}")
+            else:
+                log("Infinite lives cheat active - ball lost but life not deducted.")
             if self.lives <= 0:
                 self.state = STATE_GAME_OVER
                 play_sound("game_over")
                 self.finalize_score()
                 log("Game Over triggered.")
             else:
-                self.paddle = Paddle()
+                self.paddle = self._new_paddle()
                 speed = self.cfg["ball_speed"] * self.stage_speed_mult
                 b = Ball(
                     self.paddle.x + self.paddle.width / 2,
@@ -2213,10 +2245,9 @@ class Game:
             tags.append(("SFX OFF", GRAY))
         if not BGM_ON:
             tags.append(("BGM OFF", GRAY))
-        # Placed directly beside the SCORE text (same header row) instead of
-        # below it, since a fixed row at BRICK_TOP used to sit right on top
-        # of the first row of bricks. Tags wrap onto extra lines within the
-        # header if needed, but never drop below BRICK_TOP.
+        # Status tags sit beside the SCORE text in the header row, wrapping onto
+        # extra lines within the header if needed, but never dropping below
+        # BRICK_TOP - keeping the play field clear of the first row of bricks.
         if tags:
             score_w, _ = FONT_SMALL.size(score_text)
             stage_w, _ = FONT_SMALL.size(stage_hud_text)
@@ -2269,10 +2300,11 @@ class Game:
 
         stage_select_rect = pygame.Rect(0, 0, round(300 * s), round(46 * s))
         stage_select_rect.center = (WIDTH // 2, round(275 * s))
+        completed = CONFIG.get("game_completed", False) or self.cheat_unlock
         buttons.append(
             (
                 "stage_select",
-                Button(stage_select_rect, "STAGE SELECT", enabled=CONFIG.get("game_completed", False)),
+                Button(stage_select_rect, "STAGE SELECT", enabled=completed),
             )
         )
 
@@ -2287,7 +2319,7 @@ class Game:
         buttons.append(("highscores", Button(r, "CHECK HIGH SCORE")))
         r = pygame.Rect(col_x[1], row0_y, w, h)
         buttons.append(
-            ("endless", Button(r, "ENDLESS MODE", enabled=CONFIG.get("game_completed", False)))
+            ("endless", Button(r, "ENDLESS MODE", enabled=completed))
         )
 
         r = pygame.Rect(col_x[0], row1_y, w, h)
@@ -2301,6 +2333,13 @@ class Game:
         buttons.append(("sfx", Button(r, f"SOUND: {'ON' if SFX_ON else 'OFF'}")))
         r = pygame.Rect(col_x[1], row2_y, w, h)
         buttons.append(("quit", Button(r, "QUIT")))
+
+        # Cheat code entry - visually separated from the regular menu buttons
+        # with an extra gap, and smaller/dimmer so it doesn't compete with them.
+        cheat_w, cheat_h = round(220 * s), round(36 * s)
+        cheat_rect = pygame.Rect(0, 0, cheat_w, cheat_h)
+        cheat_rect.center = (WIDTH // 2, row2_y + h + round(28 * s))
+        buttons.append(("cheat", Button(cheat_rect, "ENTER CHEAT CODE")))
 
         return buttons
 
@@ -2319,7 +2358,7 @@ class Game:
         total_w = cols * btn_w + (cols - 1) * gap
         start_x = WIDTH // 2 - total_w // 2
         start_y = round(220 * s)
-        unlocked = CONFIG.get("game_completed", False)
+        unlocked = CONFIG.get("game_completed", False) or self.cheat_unlock
         for i in range(TOTAL_STAGES):
             col, row = i % cols, i // cols
             r = pygame.Rect(
@@ -2384,19 +2423,28 @@ class Game:
                 (WIDTH // 2, round(118 * s)),
             )
             self.draw_buttons(self.build_menu_buttons())
+            if self.cheat_just_activated > 0:
+                draw_text_center(
+                    screen,
+                    "CHEAT ACTIVATED",
+                    FONT_SMALL,
+                    YELLOW,
+                    (WIDTH // 2, round(300 * s)),
+                    glow=ORANGE,
+                )
             draw_text_center(
                 screen,
                 "Arrows/A-D or Mouse to move  •  SPACE/Click to launch  •  P/ESC to pause",
                 FONT_TINY,
                 GRAY,
-                (WIDTH // 2, round(532 * s)),
+                (WIDTH // 2, round(598 * s)),
             )
             draw_text_center(
                 screen,
                 "Ctrl / Alt shows or hides the mouse cursor during play",
                 FONT_TINY,
                 GRAY,
-                (WIDTH // 2, round(554 * s)),
+                (WIDTH // 2, round(620 * s)),
             )
             draw_text_center(
                 screen,
@@ -2405,6 +2453,8 @@ class Game:
                 GRAY,
                 (WIDTH // 2, HEIGHT - round(24 * s)),
             )
+            if self.cheat_prompt_open:
+                self.draw_cheat_prompt(screen)
 
         elif self.state == STATE_HIGHSCORES:
             draw_text_center(
@@ -2440,7 +2490,7 @@ class Game:
                 (WIDTH // 2, round(100 * s)),
                 glow=(0, 60, 70),
             )
-            if not CONFIG.get("game_completed", False):
+            if not (CONFIG.get("game_completed", False) or self.cheat_unlock):
                 draw_text_center(
                     screen,
                     "Clear all 10 stages to unlock",
@@ -2673,16 +2723,146 @@ class Game:
         elif action == "sfx":
             set_sfx(not SFX_ON)
         elif action == "stage_select":
-            if CONFIG.get("game_completed", False):
+            if CONFIG.get("game_completed", False) or self.cheat_unlock:
                 self.state = STATE_STAGE_SELECT
         elif action == "endless":
-            if CONFIG.get("game_completed", False):
+            if CONFIG.get("game_completed", False) or self.cheat_unlock:
                 self.start_endless()
         elif action == "quit":
             self.quit_game()
+        elif action == "cheat":
+            self._open_cheat_prompt()
+            return
         play_sound("ui_click")
 
-    def handle_keydown(self, key):
+    # ---------------- cheat codes ----------------
+    def _open_cheat_prompt(self):
+        self.cheat_prompt_open = True
+        self.cheat_input_text = ""
+        self.cheat_wrong = False
+        self.cheat_shake_timer = 0.0
+        play_sound("ui_click")
+
+    def _close_cheat_prompt(self):
+        self.cheat_prompt_open = False
+        self.cheat_input_text = ""
+        self.cheat_wrong = False
+        self.cheat_shake_timer = 0.0
+
+    def _apply_cheats_to_current_paddle(self):
+        self.paddle.cheat_infinite_wide = self.cheat_infinite_wide
+
+    def _submit_cheat_code(self):
+        code = self.cheat_input_text.strip()
+        if not code:
+            return
+        if code == "Keqing":
+            self.cheat_unlock = True
+            self._apply_cheats_to_current_paddle()
+            play_sound("powerup_good")
+            self.cheat_just_activated = 1.6
+            self._close_cheat_prompt()
+        elif code == "Keqing is GOAT":
+            self.cheat_unlock = True
+            self.cheat_infinite_lives = True
+            self.cheat_infinite_wide = True
+            self._apply_cheats_to_current_paddle()
+            play_sound("powerup_good")
+            self.cheat_just_activated = 1.6
+            self._close_cheat_prompt()
+        else:
+            self.cheat_wrong = True
+            self.cheat_shake_timer = self.cheat_shake_total
+            play_sound("powerup_bad")
+
+    def _handle_cheat_keydown(self, event):
+        key = event.key
+        if key == pygame.K_ESCAPE:
+            self._close_cheat_prompt()
+            play_sound("ui_click")
+            return
+        if key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self._submit_cheat_code()
+            return
+        if key == pygame.K_BACKSPACE:
+            if self.cheat_input_text:
+                self.cheat_input_text = self.cheat_input_text[:-1]
+            self.cheat_wrong = False
+            return
+        ch = event.unicode
+        if ch and ch.isprintable() and len(self.cheat_input_text) < 32:
+            self.cheat_input_text += ch
+            self.cheat_wrong = False
+
+    def draw_cheat_prompt(self, surface):
+        s = SCALE
+        veil = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        veil.fill((0, 0, 0, 175))
+        surface.blit(veil, (0, 0))
+
+        box_w = min(round(600 * s), WIDTH - round(60 * s))
+        box_h = round(210 * s)
+        box = pygame.Rect(0, 0, box_w, box_h)
+        box.center = (WIDTH / 2, HEIGHT / 2)
+        draw_glow_rect(surface, box, PURPLE, layers=4, expand=3, base_alpha=60, radius=round(12 * s))
+        pygame.draw.rect(
+            surface,
+            (14, 12, 24),
+            box.inflate(-round(6 * s), -round(6 * s)),
+            border_radius=round(10 * s),
+        )
+
+        draw_text_center(
+            surface,
+            "ENTER CHEAT CODE",
+            FONT_SMALL,
+            CYAN,
+            (box.centerx, box.top + round(34 * s)),
+            glow=(0, 60, 70),
+        )
+
+        shake_x = 0.0
+        if self.cheat_shake_timer > 0:
+            frac = self.cheat_shake_timer / max(0.001, self.cheat_shake_total)
+            shake_x = math.sin(self.cheat_shake_timer * 55) * round(9 * s) * frac
+
+        field_w, field_h = box_w - round(60 * s), round(46 * s)
+        field = pygame.Rect(0, 0, field_w, field_h)
+        field.center = (box.centerx + shake_x, box.centery + round(4 * s))
+        self._cheat_field_rect = field
+
+        blink_on = int(self._cheat_blink_t * 4) % 2 == 0
+        border_color = RED if (self.cheat_wrong and blink_on) else CYAN
+        pygame.draw.rect(surface, (24, 20, 38), field, border_radius=round(8 * s))
+        pygame.draw.rect(surface, border_color, field, width=max(1, round(2 * s)), border_radius=round(8 * s))
+
+        if self.cheat_wrong:
+            text_color = RED if blink_on else (110, 20, 30)
+        else:
+            text_color = WHITE
+        cursor = "|" if int(self._cheat_blink_t * 2) % 2 == 0 else ""
+        draw_text_center(surface, self.cheat_input_text + cursor, FONT_SMALL, text_color, field.center)
+
+        draw_text_center(
+            surface,
+            "ENTER to confirm",
+            FONT_TINY,
+            GRAY,
+            (box.centerx, box.bottom - round(46 * s)),
+        )
+        draw_text_center(
+            surface,
+            "click outside to cancel",
+            FONT_TINY,
+            GRAY,
+            (box.centerx, box.bottom - round(22 * s)),
+        )
+
+    def handle_keydown(self, event):
+        if self.cheat_prompt_open:
+            self._handle_cheat_keydown(event)
+            return
+        key = event.key
         if key == pygame.K_ESCAPE:
             if self.state == STATE_MENU:
                 self.quit_game()
@@ -2717,6 +2897,12 @@ class Game:
                 )
 
     def handle_mouse_click(self, pos):
+        if self.cheat_prompt_open:
+            if not (self._cheat_field_rect and self._cheat_field_rect.collidepoint(pos)):
+                self._close_cheat_prompt()
+                play_sound("ui_click")
+            return
+
         if self.state == STATE_MENU:
             for action, btn in self.build_menu_buttons():
                 if btn.hit(pos):
@@ -2795,7 +2981,7 @@ class Game:
                         log("Window close event detected, quitting.")
                         self.quit_game()
                     elif event.type == pygame.KEYDOWN:
-                        self.handle_keydown(event.key)
+                        self.handle_keydown(event)
                     elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                         self.handle_mouse_click(mouse_pos)
                     elif event.type == pygame.VIDEORESIZE:
