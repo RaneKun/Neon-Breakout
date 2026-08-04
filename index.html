@@ -59,6 +59,8 @@
   <div id="stage">
     <canvas id="game"></canvas>
   </div>
+  <input id="cheatInputProxy" type="text" maxlength="32" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+    style="position:fixed; left:0; bottom:-40px; width:100px; height:32px; opacity:0; border:none; outline:none; padding:0; margin:0; font-size:16px; pointer-events:none;">
   <div id="loading">
     <div class="title">NEON BREAKOUT</div>
     <div class="sub" id="loading-sub">initializing...</div>
@@ -227,6 +229,7 @@ function applyDynamicResolution(){
 
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d", { alpha: false });
+const cheatInputProxy = document.getElementById("cheatInputProxy");
 const FPS = 60;
 
 // ---- Neon color palette (exact match to the original) -------------------
@@ -872,13 +875,16 @@ class Paddle {
     this.wideTimer = 0.0;
     this.shrinkTimer = 0.0;
     this.speed = PADDLE_SPEED;
+    // Session-only cheat flag (never persisted); reapplied by Game right
+    // after this object is constructed (see Game._newPaddle).
+    this.cheatInfiniteWide = false;
   }
   get rectX(){ return this.x; }
   hit(px, py){ return px>=this.x && px<=this.x+this.width && py>=this.y && py<=this.y+this.height; }
   intersects(rx, ry, rw, rh){ return this.x < rx+rw && this.x+this.width > rx && this.y < ry+rh && this.y+this.height > ry; }
   applyWidth(dt){
     let target;
-    if (this.wideTimer > 0) target = PADDLE_W_WIDE;
+    if (this.wideTimer > 0 || this.cheatInfiniteWide) target = PADDLE_W_WIDE;
     else if (this.shrinkTimer > 0) target = PADDLE_W_SHRUNK;
     else target = PADDLE_W_NORMAL;
     if (this.width !== target){
@@ -902,7 +908,7 @@ class Paddle {
   grantWide(){ this.wideTimer = 9.0; this.shrinkTimer = 0.0; }
   grantShrink(){ this.shrinkTimer = 7.0; this.wideTimer = 0.0; }
   draw(){
-    const color = this.wideTimer > 0 ? GREEN : (this.shrinkTimer > 0 ? RED : CYAN);
+    const color = (this.wideTimer > 0 || this.cheatInfiniteWide) ? GREEN : (this.shrinkTimer > 0 ? RED : CYAN);
     drawGlowRect(this.x, this.y, this.width, this.height, color, { radius: 8 });
   }
 }
@@ -1186,8 +1192,28 @@ class Game {
     this.score = 0;
     this.stage = 1;
     this.cursorOverrideVisible = false;
+
+    // ---- cheat codes (session-only: never saved, cleared on page reload) ----
+    this.cheatUnlock = false; // unlocks stage select + endless mode
+    this.cheatInfiniteLives = false;
+    this.cheatInfiniteWide = false;
+    this.cheatPromptOpen = false;
+    this.cheatInputText = "";
+    this.cheatWrong = false;
+    this.cheatShakeTimer = 0.0;
+    this.cheatShakeTotal = 0.35;
+    this.cheatJustActivated = 0.0;
+    this._cheatFieldRect = null;
+    this._cheatBlinkT = 0.0;
+
     this.resetFull();
     this.state = STATE_MENU; // start on the menu, not straight into READY
+  }
+
+  _newPaddle(){
+    const pd = new Paddle();
+    pd.cheatInfiniteWide = this.cheatInfiniteWide;
+    return pd;
   }
 
   _beginNewRun(){
@@ -1202,7 +1228,7 @@ class Game {
     this._beginNewRun();
     this.stage = 1; this.endless = false; this.score = 0;
     this.lives = 4; // 3 hearts shown at start (hearts displayed = lives-1)
-    this.paddle = new Paddle();
+    this.paddle = this._newPaddle();
     this.balls = []; this.bricks = []; this.powerups = []; this.particles = []; this.lasers = [];
     this.readyTimer = 0.0; this.stageClearBonus = 0;
     this.mouseControlActive = false;
@@ -1247,7 +1273,7 @@ class Game {
       result = buildBricks(stage);
     }
     this.bricks = result.bricks; this.cfg = result.cfg;
-    this.paddle = new Paddle();
+    this.paddle = this._newPaddle();
     this.powerups = []; this.particles = [];
     this.stageSpeedMult = 1.0;
     const speed = this.cfg.ballSpeed;
@@ -1274,7 +1300,8 @@ class Game {
     let pool;
     if (this.timeExpired) pool = POWERUP_KEYS.filter(k => k!=="slow" && k!=="shrink");
     else pool = POWERUP_KEYS.slice();
-    if (this.lives >= MAX_LIVES) pool = pool.filter(k => k!=="life");
+    if (this.lives >= MAX_LIVES || this.cheatInfiniteLives) pool = pool.filter(k => k!=="life");
+    if (this.cheatInfiniteWide) pool = pool.filter(k => k!=="widen");
     if (pool.length === 0) return;
     const weights = pool.map(k => POWERUP_INFO[k].weight);
     const kind = weightedChoice(pool, weights);
@@ -1400,6 +1427,9 @@ class Game {
   // ---------------- update ----------------
   update(dt, keys, mousePos, mouseMoved){
     this._autosaveTick(dt);
+    this._cheatBlinkT += dt;
+    if (this.cheatShakeTimer > 0) this.cheatShakeTimer = Math.max(0, this.cheatShakeTimer - dt);
+    if (this.cheatJustActivated > 0) this.cheatJustActivated = Math.max(0, this.cheatJustActivated - dt);
     this.mouseLogical = mousePos;
     if (mouseMoved) this.mouseControlActive = true;
     if (keys["ArrowLeft"] || keys["ArrowRight"] || keys["KeyA"] || keys["KeyD"]) this.mouseControlActive = false;
@@ -1475,7 +1505,7 @@ class Game {
       if (laser.state === "firing" && !laser.hitApplied){
         if (laser.intersectsPaddle(this.paddle)){
           laser.hitApplied = true;
-          this.lives -= 1;
+          if (!this.cheatInfiniteLives) this.lives -= 1;
           playSound("laser_hit");
           this.spawnParticles(this.paddle.x+this.paddle.width/2, this.paddle.y, RED, 20);
           this.triggerShake(0.35, 12);
@@ -1565,14 +1595,16 @@ class Game {
     }
 
     if (this.balls.length === 0){
-      this.lives -= 1;
-      playSound("life_lost");
+      if (!this.cheatInfiniteLives){
+        this.lives -= 1;
+        playSound("life_lost");
+      }
       if (this.lives <= 0){
         this.state = STATE_GAME_OVER;
         playSound("game_over");
         this.finalizeScore();
       } else {
-        this.paddle = new Paddle();
+        this.paddle = this._newPaddle();
         const speed = this.cfg.ballSpeed * this.stageSpeedMult;
         const b = new Ball(this.paddle.x+this.paddle.width/2, this.paddle.y-BALL_RADIUS-2, speed, null, true);
         this.balls = [b];
@@ -1698,10 +1730,9 @@ class Game {
     if (!SFX_ON) tags.push(["SFX OFF", GRAY]);
     if (!BGM_ON) tags.push(["BGM OFF", GRAY]);
 
-    // Placed directly beside the SCORE text (same header row) instead of
-    // below it, since a fixed row at BRICK_TOP used to sit right on top of
-    // the first row of bricks. Tags wrap onto extra lines within the header
-    // if needed, but never drop below BRICK_TOP.
+    // Status tags sit beside the SCORE text in the header row, wrapping onto
+    // extra lines within the header if needed, but never dropping below
+    // BRICK_TOP - keeping the play field clear of the first row of bricks.
     if (tags.length){
       ctx.font = FONT_SMALL;
       const scoreW = ctx.measureText(scoreText).width;
@@ -1770,7 +1801,7 @@ class Game {
     const maxStage = CONFIG.max_stage_reached || 1;
     const continueLabel = maxStage>1 ? `CONTINUE (STAGE ${maxStage})` : "CONTINUE";
     buttons.push(["continue", new Button(WIDTH/2-singleW/2, 220-singleH/2, singleW, singleH, continueLabel, maxStage>1)]);
-    const completed = !!CONFIG.game_completed;
+    const completed = !!CONFIG.game_completed || this.cheatUnlock;
     buttons.push(["stage_select", new Button(WIDTH/2-singleW/2, 275-singleH/2, singleW, singleH, "STAGE SELECT", completed)]);
 
     const w=260, h=54, gapX=20, gapY=14;
@@ -1781,18 +1812,109 @@ class Game {
     buttons.push(["fullscreen", new Button(colX[0], row1Y, w, h, "FULLSCREEN: "+(CONFIG.fullscreen?"ON":"OFF"))]);
     buttons.push(["bgm", new Button(colX[1], row1Y, w, h, "BGM: "+(BGM_ON?"ON":"OFF"))]);
     buttons.push(["sfx", new Button(colX[0], row2Y, w*2+gapX, h, "SOUND: "+(SFX_ON?"ON":"OFF"))]);
+    // Cheat code entry - visually separated from the regular menu buttons.
+    const cheatW=220, cheatH=36;
+    buttons.push(["cheat", new Button(WIDTH/2-cheatW/2, row2Y+h+26, cheatW, cheatH, "ENTER CHEAT CODE")]);
     return buttons;
+  }
+
+  // ---------------- cheat codes ----------------
+  openCheatPrompt(){
+    this.cheatPromptOpen = true;
+    this.cheatInputText = "";
+    this.cheatWrong = false;
+    this.cheatShakeTimer = 0.0;
+    playSound("ui_click");
+    cheatInputProxy.value = "";
+    cheatInputProxy.focus();
+  }
+  closeCheatPrompt(){
+    this.cheatPromptOpen = false;
+    this.cheatInputText = "";
+    this.cheatWrong = false;
+    this.cheatShakeTimer = 0.0;
+    cheatInputProxy.value = "";
+    cheatInputProxy.blur();
+  }
+  _applyCheatsToCurrentPaddle(){
+    this.paddle.cheatInfiniteWide = this.cheatInfiniteWide;
+  }
+  submitCheatCode(){
+    const code = this.cheatInputText.trim();
+    if (!code) return;
+    if (code === "Keqing"){
+      this.cheatUnlock = true;
+      this._applyCheatsToCurrentPaddle();
+      playSound("powerup_good");
+      this.cheatJustActivated = 1.6;
+      this.closeCheatPrompt();
+    } else if (code === "Keqing is GOAT"){
+      this.cheatUnlock = true;
+      this.cheatInfiniteLives = true;
+      this.cheatInfiniteWide = true;
+      this._applyCheatsToCurrentPaddle();
+      playSound("powerup_good");
+      this.cheatJustActivated = 1.6;
+      this.closeCheatPrompt();
+    } else {
+      this.cheatWrong = true;
+      this.cheatShakeTimer = this.cheatShakeTotal;
+      playSound("powerup_bad");
+    }
+  }
+  drawCheatPrompt(){
+    ctx.fillStyle = rgb([0,0,0], 175/255);
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+    const boxW = Math.min(560, WIDTH-80), boxH = 190;
+    const boxX = WIDTH/2 - boxW/2, boxY = HEIGHT/2 - boxH/2;
+    drawGlowRect(boxX, boxY, boxW, boxH, PURPLE, { layers: 4, expand: 3, baseAlpha: 60, radius: 12 });
+    ctx.fillStyle = rgb([14,12,24], 1);
+    roundRectPath(boxX+3, boxY+3, boxW-6, boxH-6, 10);
+    ctx.fill();
+
+    drawTextCenter("ENTER CHEAT CODE", FONT_SMALL, CYAN, WIDTH/2, boxY+34, [0,60,70]);
+
+    let shakeX = 0.0;
+    if (this.cheatShakeTimer > 0){
+      const frac = this.cheatShakeTimer / Math.max(0.001, this.cheatShakeTotal);
+      shakeX = Math.sin(this.cheatShakeTimer*55) * 9 * frac;
+    }
+
+    const fieldW = boxW-60, fieldH = 46;
+    const fieldCx = WIDTH/2+shakeX, fieldCy = HEIGHT/2+4;
+    const fieldX = fieldCx-fieldW/2, fieldY = fieldCy-fieldH/2;
+    this._cheatFieldRect = { x: fieldX, y: fieldY, w: fieldW, h: fieldH };
+
+    const blinkOn = Math.floor(this._cheatBlinkT*4)%2===0;
+    const borderColor = (this.cheatWrong && blinkOn) ? RED : CYAN;
+    ctx.fillStyle = rgb([24,20,38], 1);
+    roundRectPath(fieldX, fieldY, fieldW, fieldH, 8);
+    ctx.fill();
+    ctx.strokeStyle = rgb(borderColor, 1);
+    ctx.lineWidth = 2;
+    roundRectPath(fieldX, fieldY, fieldW, fieldH, 8);
+    ctx.stroke();
+
+    let textColor;
+    if (this.cheatWrong) textColor = blinkOn ? RED : [110,20,30];
+    else textColor = WHITE;
+    const cursor = Math.floor(this._cheatBlinkT*2)%2===0 ? "|" : "";
+    drawTextCenter(this.cheatInputText+cursor, FONT_SMALL, textColor, fieldCx, fieldCy);
+
+    drawTextCenter("ENTER to confirm  \u2022  click outside to cancel", FONT_TINY, GRAY, WIDTH/2, boxY+boxH-24);
   }
 
   handleMenuAction(action){
     if (action==="start") this.resetFull();
     else if (action==="continue"){ if ((CONFIG.max_stage_reached||1)>1) this.continueGame(); }
     else if (action==="highscores"){ this.highscores = loadHighscores(); this.state = STATE_HIGHSCORES; }
-    else if (action==="stage_select"){ if (CONFIG.game_completed) this.state = STATE_STAGE_SELECT; }
-    else if (action==="endless"){ if (CONFIG.game_completed) this.startEndless(); }
+    else if (action==="stage_select"){ if (CONFIG.game_completed || this.cheatUnlock) this.state = STATE_STAGE_SELECT; }
+    else if (action==="endless"){ if (CONFIG.game_completed || this.cheatUnlock) this.startEndless(); }
     else if (action==="fullscreen") toggleFullscreen();
     else if (action==="bgm") setBgm(!BGM_ON);
     else if (action==="sfx") setSfx(!SFX_ON);
+    else if (action==="cheat"){ this.openCheatPrompt(); return; }
     playSound("ui_click");
   }
 
@@ -1800,10 +1922,14 @@ class Game {
     drawTextCenter("NEON BREAKOUT", FONT_BIG, CYAN, WIDTH/2, 70, [0,60,70]);
     drawTextCenter("10 stages. Rare power-ups. Patience required.", FONT_SMALL, WHITE, WIDTH/2, 118);
     for (const [,btn] of this.buildMenuButtons()) btn.draw(rectContains(btn,this.mouseLogical.x,this.mouseLogical.y));
+    if (this.cheatJustActivated > 0){
+      drawTextCenter("CHEAT ACTIVATED", FONT_SMALL, YELLOW, WIDTH/2, 300, ORANGE);
+    }
     const controlHint = IS_TOUCH ? "Drag to move  \u2022  Tap to launch  \u2022  Tap the pause icon to pause" : "Arrows/A-D or Mouse to move  \u2022  SPACE/Click to launch  \u2022  P/ESC to pause";
-    drawTextCenter(controlHint, FONT_TINY, GRAY, WIDTH/2, 532);
-    if (!IS_TOUCH) drawTextCenter("Ctrl / Alt shows or hides the mouse cursor during play", FONT_TINY, GRAY, WIDTH/2, 554);
+    drawTextCenter(controlHint, FONT_TINY, GRAY, WIDTH/2, 598);
+    if (!IS_TOUCH) drawTextCenter("Ctrl / Alt shows or hides the mouse cursor during play", FONT_TINY, GRAY, WIDTH/2, 620);
     drawTextCenter("made with \u2665 by Rane Kun", FONT_TINY, GRAY, WIDTH/2, HEIGHT-24);
+    if (this.cheatPromptOpen) this.drawCheatPrompt();
   }
 
   buildHighscoresButtons(){ return [["back", new Button(WIDTH/2-100, HEIGHT-70-25, 200, 50, "BACK")]]; }
@@ -1828,7 +1954,7 @@ class Game {
     const cols=5, btnW=140, btnH=80, gap=20;
     const totalW = cols*btnW + (cols-1)*gap;
     const startX = WIDTH/2 - totalW/2, startY=220;
-    const unlocked = !!CONFIG.game_completed;
+    const unlocked = !!CONFIG.game_completed || this.cheatUnlock;
     for (let i=0;i<TOTAL_STAGES;i++){
       const col=i%cols, row=Math.floor(i/cols);
       buttons.push([`stage_${i+1}`, new Button(startX+col*(btnW+gap), startY+row*(btnH+gap), btnW, btnH, `STAGE ${i+1}`, unlocked)]);
@@ -1838,7 +1964,7 @@ class Game {
   }
   drawStageSelect(){
     drawTextCenter("STAGE SELECT", FONT_BIG, CYAN, WIDTH/2, 100, [0,60,70]);
-    if (!CONFIG.game_completed) drawTextCenter("Clear all 10 stages to unlock", FONT_SMALL, GRAY, WIDTH/2, 160);
+    if (!CONFIG.game_completed && !this.cheatUnlock) drawTextCenter("Clear all 10 stages to unlock", FONT_SMALL, GRAY, WIDTH/2, 160);
     for (const [,btn] of this.buildStageSelectButtons()) btn.draw(rectContains(btn,this.mouseLogical.x,this.mouseLogical.y));
   }
 
@@ -1883,6 +2009,12 @@ class Game {
   }
 
   handlePrimaryClick(pos){
+    if (this.cheatPromptOpen){
+      const r = this._cheatFieldRect;
+      const inside = r && pos.x >= r.x && pos.x <= r.x+r.w && pos.y >= r.y && pos.y <= r.y+r.h;
+      if (!inside){ this.closeCheatPrompt(); playSound("ui_click"); }
+      return;
+    }
     if (this.state === STATE_MENU){
       for (const [action,btn] of this.buildMenuButtons()) if (btn.hit(pos.x,pos.y)){ this.handleMenuAction(action); return; }
       return;
@@ -1989,9 +2121,30 @@ function isGameplayTouchState(state){ return state === STATE_READY || state === 
 
 window.addEventListener("keydown", (e) => {
   unlockAudio();
+  if (game.cheatPromptOpen){
+    // Typing, Enter, and Escape are handled by cheatInputProxy's own
+    // listeners below (it holds native focus while the prompt is open,
+    // which is also what brings up the on-screen keyboard on mobile and
+    // enables paste). We just keep game controls from firing underneath it.
+    if (["Space","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.code)) e.preventDefault();
+    return;
+  }
   if (!keys[e.code]) game.handleKeydown(e.code);
   keys[e.code] = true;
   if (["Space","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.code)) e.preventDefault();
+});
+cheatInputProxy.addEventListener("input", () => {
+  game.cheatInputText = cheatInputProxy.value;
+  game.cheatWrong = false;
+});
+cheatInputProxy.addEventListener("keydown", (e) => {
+  if (e.code === "Enter" || e.code === "NumpadEnter"){
+    e.preventDefault();
+    game.submitCheatCode();
+  } else if (e.code === "Escape"){
+    game.closeCheatPrompt();
+    playSound("ui_click");
+  }
 });
 window.addEventListener("keyup", (e) => { keys[e.code] = false; });
 
@@ -2111,11 +2264,10 @@ function frame(now){
 }
 
 // --------------------------------------------------------------------------
-// BOOT - staged with setTimeout (a real macrotask, so the browser actually
-// paints between steps - chained requestAnimationFrame calls can get
-// batched together without an intervening paint, which is what made loading
-// look frozen during Void Breaker's first pass). SFX build fast and block
-// the loading screen briefly; the ~2 minute music track builds in small
+// BOOT - staged with setTimeout (a real macrotask, so the browser actually paints
+// between steps; chained requestAnimationFrame calls can batch without an
+// intervening paint and leave the loading screen looking frozen). SFX build fast
+// and block the loading screen briefly; the ~2 minute music track builds in small
 // chunks in the background, well after the menu is already interactive.
 // --------------------------------------------------------------------------
 function setLoadingProgress(pct, text){
