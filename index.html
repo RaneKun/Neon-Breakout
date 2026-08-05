@@ -59,8 +59,13 @@
   <div id="stage">
     <canvas id="game"></canvas>
   </div>
-  <input id="cheatInputProxy" type="text" maxlength="32" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
-    style="position:fixed; left:0; bottom:-40px; width:100px; height:32px; opacity:0; border:none; outline:none; padding:0; margin:0; font-size:16px; pointer-events:none;">
+  <form id="cheatForm" autocomplete="off"
+    style="position:fixed; left:0; bottom:-40px; width:100px; height:32px; margin:0; padding:0;">
+    <input id="cheatInputProxy" type="text" maxlength="32" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+      enterkeyhint="go" inputmode="text"
+      style="width:100%; height:100%; opacity:0; border:none; outline:none; padding:0; margin:0; font-size:16px; pointer-events:none;
+      -webkit-user-select:text; user-select:text; touch-action:manipulation;">
+  </form>
   <div id="loading">
     <div class="title">NEON BREAKOUT</div>
     <div class="sub" id="loading-sub">initializing...</div>
@@ -230,6 +235,7 @@ function applyDynamicResolution(){
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d", { alpha: false });
 const cheatInputProxy = document.getElementById("cheatInputProxy");
+const cheatForm = document.getElementById("cheatForm");
 const FPS = 60;
 
 // ---- Neon color palette (exact match to the original) -------------------
@@ -668,7 +674,25 @@ function quickToggleMute(){ const turnOn = !(SFX_ON || BGM_ON); setSfx(turnOn); 
 const stageEl = document.getElementById("stage");
 let dpr = Math.max(1, window.devicePixelRatio || 1);
 
+// On mobile, opening the on-screen keyboard shrinks the VISUAL viewport
+// without necessarily shrinking the LAYOUT viewport that `100%`/`inset:0`
+// CSS is based on - so a `position:fixed` full-screen element can end up
+// partly hidden behind the keyboard, especially in landscape where the
+// keyboard eats a large share of the limited height. When the Visual
+// Viewport API is available, we explicitly size/position #stage to match
+// it so resizeCanvas() (which reads stageEl.clientWidth/clientHeight)
+// always fits the canvas within whatever area is actually visible.
+function syncStageToVisualViewport(){
+  const vv = window.visualViewport;
+  if (!vv){ return; }
+  stageEl.style.left = vv.offsetLeft + "px";
+  stageEl.style.top = vv.offsetTop + "px";
+  stageEl.style.width = vv.width + "px";
+  stageEl.style.height = vv.height + "px";
+}
+
 function resizeCanvas(){
+  syncStageToVisualViewport();
   dpr = Math.max(1, window.devicePixelRatio || 1);
   const vw = stageEl.clientWidth, vh = stageEl.clientHeight;
   const scale = Math.max(0.0001, Math.min(vw / WIDTH, vh / HEIGHT));
@@ -682,6 +706,10 @@ function resizeCanvas(){
 }
 window.addEventListener("resize", resizeCanvas);
 window.addEventListener("orientationchange", () => setTimeout(resizeCanvas, 60));
+if (window.visualViewport){
+  window.visualViewport.addEventListener("resize", resizeCanvas);
+  window.visualViewport.addEventListener("scroll", resizeCanvas);
+}
 
 function clientToLogical(clientX, clientY){
   const rect = canvas.getBoundingClientRect();
@@ -1730,9 +1758,10 @@ class Game {
     if (!SFX_ON) tags.push(["SFX OFF", GRAY]);
     if (!BGM_ON) tags.push(["BGM OFF", GRAY]);
 
-    // Status tags sit beside the SCORE text in the header row, wrapping onto
-    // extra lines within the header if needed, but never dropping below
-    // BRICK_TOP - keeping the play field clear of the first row of bricks.
+    // Placed directly beside the SCORE text (same header row) instead of
+    // below it, since a fixed row at BRICK_TOP used to sit right on top of
+    // the first row of bricks. Tags wrap onto extra lines within the header
+    // if needed, but never drop below BRICK_TOP.
     if (tags.length){
       ctx.font = FONT_SMALL;
       const scoreW = ctx.measureText(scoreText).width;
@@ -2122,11 +2151,12 @@ function isGameplayTouchState(state){ return state === STATE_READY || state === 
 window.addEventListener("keydown", (e) => {
   unlockAudio();
   if (game.cheatPromptOpen){
-    // Typing, Enter, and Escape are handled by cheatInputProxy's own
-    // listeners below (it holds native focus while the prompt is open,
-    // which is also what brings up the on-screen keyboard on mobile and
-    // enables paste). We just keep game controls from firing underneath it.
-    if (["Space","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.code)) e.preventDefault();
+    // Focus is genuinely on cheatInputProxy while the prompt is open, so we
+    // deliberately do NOT preventDefault here - the input needs its native
+    // handling of Space (typing a space) and Left/Right (moving the text
+    // cursor) to work. Typing, Enter, and Escape are wired on the proxy's
+    // own listeners below. Since we return before the keys[] bookkeeping,
+    // none of this leaks through as a game control either.
     return;
   }
   if (!keys[e.code]) game.handleKeydown(e.code);
@@ -2138,18 +2168,24 @@ cheatInputProxy.addEventListener("input", () => {
   game.cheatWrong = false;
 });
 cheatInputProxy.addEventListener("keydown", (e) => {
-  if (e.code === "Enter" || e.code === "NumpadEnter"){
-    e.preventDefault();
-    game.submitCheatCode();
-  } else if (e.code === "Escape"){
+  if (e.code === "Escape"){
     game.closeCheatPrompt();
     playSound("ui_click");
   }
+});
+// Many mobile virtual keyboards don't fire a proper keydown for their
+// Enter/Go/Done key, so we rely on the form's native 'submit' behavior
+// instead - a lone text input inside a form reliably submits on Enter
+// across desktop keyboards AND mobile IMEs.
+cheatForm.addEventListener("submit", (e) => {
+  e.preventDefault();
+  game.submitCheatCode();
 });
 window.addEventListener("keyup", (e) => { keys[e.code] = false; });
 
 canvas.addEventListener("mousemove", (e) => { mousePos = clientToLogical(e.clientX, e.clientY); });
 canvas.addEventListener("mousedown", (e) => {
+  e.preventDefault();
   unlockAudio();
   if (e.button !== 0) return;
   game.handlePrimaryClick(clientToLogical(e.clientX, e.clientY));
@@ -2264,10 +2300,11 @@ function frame(now){
 }
 
 // --------------------------------------------------------------------------
-// BOOT - staged with setTimeout (a real macrotask, so the browser actually paints
-// between steps; chained requestAnimationFrame calls can batch without an
-// intervening paint and leave the loading screen looking frozen). SFX build fast
-// and block the loading screen briefly; the ~2 minute music track builds in small
+// BOOT - staged with setTimeout (a real macrotask, so the browser actually
+// paints between steps - chained requestAnimationFrame calls can get
+// batched together without an intervening paint, which is what made loading
+// look frozen during Void Breaker's first pass). SFX build fast and block
+// the loading screen briefly; the ~2 minute music track builds in small
 // chunks in the background, well after the menu is already interactive.
 // --------------------------------------------------------------------------
 function setLoadingProgress(pct, text){
